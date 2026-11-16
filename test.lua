@@ -2,84 +2,101 @@
 -- @uid 0
 
 -- ============================================================================
---  0x resolver  ·  v3.0  ·  unified build
+--  0x  ·  v4.1  ·  resolver + ragebot assist + anti-aim
 --  Neverlose CS2 Lua  ·  API: github.com/PbLJk/neverlose-lua-api
---
---  This build merges three scripts into the resolver (s2) without renaming it:
---    s2  "0x resolver"        layered yaw/pitch resolver (the host, owns the menu)
---    s1  "0x · ragebot"       hitchance / min-damage / safepoint / body-aim assist
---    customresolver.lua       compact adaptive / jitter-spin / brute / static resolver
 --
 --  Credits: @kukluxk · @likvidatorchaes (subcult)
 --
 --  RESOLVER
 --    1. per-netupdate yaw history   -> AA class (static / sway / jitter / spin / random)
 --    2. pitch history               -> fake pitch class (down / up / zero / flicker)
---    3. body-yaw hint               -> model geometry from hitboxes (legs / shoulders)
---    4. freestanding hint           -> cover traces around the enemy head
+--    3. body-yaw hint               -> model geometry from hitboxes (legs / shoulders), throttled
+--    4. freestanding hint           -> cover traces around the enemy head, throttled + cached
 --    5. movement memory + direction -> last movement yaw, side from movement direction
---    6. shot feedback               -> weapon_fire + player_hurt => hit / miss learning,
---                                      body-hit partial credit, anti-anti-bruteforce
---    7. bruteforce cycling          -> multiplier table or stepped offsets, locked on hit
---    8. persistence                 -> learned side per SteamID (db.*)
+--    6. lag-compensation watch      -> teleport / simulation-time rewind = LC break flag
+--    7. shot feedback               -> weapon_fire + player_hurt; misses are classified
+--                                      (resolver / spread / lagcomp / moving / airborne) and only
+--                                      resolver misses step the brute table
+--    8. bruteforce cycling          -> multiplier table or stepped offsets, locked on hit
+--    9. persistence                 -> learned side per SteamID (db.*)
+--   10. jitter phase prediction (4.1) -> two yaw clusters + switch period; the NEXT update is
+--                                      predicted instead of aiming at the jitter center
+--   11. hint reliability (4.1)      -> body / freestand / movement hints are re-weighted by
+--                                      how often they agreed with confirmed hits
+--  ANTI-AIM (4.1)
+--    Condition builder (shared / standing / walking / running / ducking / air): pitch, yaw
+--    base, offset and a yaw modifier (jitter, 3-way, 5-way, spin, sway, random). Manual yaw
+--    binds, freestanding, anti-backstab, shuffle-when-hit, use / attack / grenade / ladder
+--    safety and a movement fix. Angles are written with cmd:set_view_angles in createmove.
 --  RAGEBOT ASSIST
 --    Reads and writes your ragebot through config.get / config.set. Paths are discovered
---    from config.keys (group "Config link"); originals are journaled (db) and restored on
---    disable, pause, death, weapon change, map change, crash recovery and unload.
---    Air / apex hitchance, lethal body-aim via trace.damage, strict / body / damage binds,
---    and resolver-aware body-aim + hitchance for unresolved targets.
+--    from config.keys; originals are journaled (db) and restored on disable, pause, death,
+--    weapon change, map change, crash recovery and unload.
 --  VISUALS
---    Player overlay, yaw lines, status panel (draggable while the menu is open),
---    event feed, debug panel.
+--    Player overlay, yaw lines, status panel (draggable while the menu is open, never while
+--    the cursor is over the menu), event feed, debug panel, optional native ESP flag,
+--    anti-aim state row and direction arrows.
+--  CONFIG EXCHANGE
+--    Export: data\db\0x_export.json (+ console, + clipboard when Allow Insecure is on).
+--    Import: data\db\0x_import.json or a pasted snapshot. Snapshots are produced by the web
+--    companion and may carry manual ragebot config paths.
 --
 --  m_angEyeAngles override requires "Allow Insecure". Without it the resolver runs in
 --  tracking mode (overlay, stats, learning and the ragebot assist keep working).
 -- ============================================================================
 
 local META = {
-    name        = "0x resolver",
-    version     = "3.0",
-    db          = "0x_resolver_v21",     -- learned sides, compatible with v2.1
-    db_settings = "0x_s2_v3_settings",   -- menu snapshot
-    db_journal  = "0x_v31_journal",      -- ragebot originals, compatible with s1 v3.x
-    db_legacy   = "0x_v31_settings",     -- s1 settings, imported once when no v3 snapshot exists
-    credits     = "@kukluxk · @likvidatorchaes (subcult)",
+    name           = "0x resolver",
+    version        = "4.1",
+    schema         = 4,
+    db             = "0x_resolver_v21",     -- learned sides (compatible with v2.1 / v3.0)
+    db_settings    = "0x_v4_settings",      -- menu snapshot
+    db_settings_v3 = "0x_s2_v3_settings",   -- v3.0 snapshot, imported once
+    db_legacy      = "0x_v31_settings",     -- s1 snapshot, imported once
+    db_journal     = "0x_v31_journal",      -- ragebot originals (crash-safe, compatible with v3.x)
+    db_import      = "0x_import",           -- data\db\0x_import.json
+    db_export      = "0x_export",           -- data\db\0x_export.json
+    credits        = "@kukluxk · @likvidatorchaes (subcult)",
 }
 
 -- Manual config paths when auto-discovery picks the wrong ones. Example: hc = { "ragebot.hitchance" }
+-- Paths imported from a snapshot (web companion) are merged with these.
 local CUSTOM_PATHS = { hc = {}, dmg = {}, safe = {}, baim = {}, hitbox = {} }
 -- If safepoint in your ragebot is a dropdown, this is the index of the "Force" item.
 local SAFE_COMBO_VALUE = 2
 
 -- ----------------------------------------------------------------------------
--- Locals / fast paths
+-- Fast paths
 -- ----------------------------------------------------------------------------
 local floor, abs, sqrt, atan2, sin, cos, rad, deg = math.floor, math.abs, math.sqrt, math.atan2, math.sin, math.cos, math.rad, math.deg
 local max, min = math.max, math.min
-local pcall, ipairs, pairs, type, tostring, tonumber, select, next = pcall, ipairs, pairs, type, tostring, tonumber, select, next
-local format, s_lower, s_find, s_gsub, s_gmatch = string.format, string.lower, string.find, string.gsub, string.gmatch
+local pcall, pairs, type, tostring, tonumber, next = pcall, pairs, type, tostring, tonumber, next
+local format, s_lower, s_find, s_gsub, s_sub, s_upper = string.format, string.lower, string.find, string.gsub, string.sub, string.upper
 local tremove, tconcat, tsort = table.remove, table.concat, table.sort
 local band = bit.band
 
-local normalize = math.normalize_angle or function(a) a = a % 360 if a > 180 then a = a - 360 end return a end
-local clamp = math.clamp or function(v, lo, hi) if v < lo then return lo elseif v > hi then return hi end return v end
-local calc_angle = math.calc_angle or function(from, to) return (to - from):angles() end
-local lerp = math.lerp or function(a, b, t) return a + (b - a) * t end
+local function normalize(a)
+    a = a % 360
+    if a > 180 then a = a - 360 end
+    return a
+end
+local function clamp(v, lo, hi) if v < lo then return lo elseif v > hi then return hi end return v end
+local function lerp(a, b, t) return a + (b - a) * t end
+local function round(v) return floor(v + 0.5) end
+local function sign(v) if v > 0 then return 1 elseif v < 0 then return -1 end return 0 end
 
+-- Calls fn and swallows errors. Returns only the first result.
 local function safe(fn, ...)
+    if fn == nil then return nil end
     local ok, r = pcall(fn, ...)
     if ok then return r end
     return nil
 end
 
-local function sign(v)
-    if v > 0 then return 1 elseif v < 0 then return -1 end
-    return 0
-end
+-- Utility namespace (kept in one table to stay far below LuaJIT's 200-locals limit).
+local U = {}
 
-local function round(v) return floor(v + 0.5) end
-
-local function copy(v)
+function U.copy(v)
     if type(v) ~= "table" then return v end
     local o = {}
     for k, x in pairs(v) do o[k] = x end
@@ -92,7 +109,8 @@ local function same_scalar(a, b)
     return false
 end
 
-local function same(a, b)
+-- Shallow structural equality (config values: numbers, booleans, strings, flat tables).
+function U.same(a, b)
     if same_scalar(a, b) then return true end
     if type(a) ~= "table" or type(b) ~= "table" then return false end
     for k, v in pairs(a) do
@@ -104,14 +122,28 @@ local function same(a, b)
     return true
 end
 
-local function any_match(s, list)
+function U.any_match(s, list)
     for i = 1, #list do
         if s_find(s, list[i]) then return true end
     end
     return false
 end
 
-local function utf8_len(s) return select(2, s_gsub(s, "[^\128-\193]", "")) end
+function U.utf8_len(s) return select(2, s_gsub(s, "[^\128-\193]", "")) end
+
+function U.trim(s) return (s_gsub(s, "^%s+", ""):gsub("%s+$", "")) end
+
+-- Angular distance of a direction (from -> to) to view angles va.
+function U.fov(from, to, va)
+    local dx, dy, dz = to.x - from.x, to.y - from.y, to.z - from.z
+    local pitch = deg(atan2(-dz, sqrt(dx * dx + dy * dy)))
+    local yaw = deg(atan2(dy, dx))
+    local dp, dw = normalize(pitch - va.x), normalize(yaw - va.y)
+    return sqrt(dp * dp + dw * dw)
+end
+
+-- Yaw of the direction from -> to (degrees).
+function U.yaw_to(from, to) return deg(atan2(to.y - from.y, to.x - from.x)) end
 
 local function say(msg) print("[0x] " .. tostring(msg)) end
 
@@ -119,7 +151,7 @@ local function say(msg) print("[0x] " .. tostring(msg)) end
 -- Constants
 -- ----------------------------------------------------------------------------
 local C = {                    -- resolver
-    HISTORY          = 16,     -- yaw samples kept per player (~250 ms @ 64 tick)
+    HISTORY          = 24,     -- yaw samples kept per player (~375 ms @ 64 tick; fits delayed jitter)
     JITTER_MIN_DELTA = 12,     -- deg; a delta counts as "big" above this
     SPIN_MIN_RATE    = 20,     -- deg/update mean signed drift to classify as spin
     STATIC_MAX_DELTA = 3,      -- deg mean |delta| below this = static
@@ -131,12 +163,17 @@ local C = {                    -- resolver
     BODY_MAX_DELTA   = 35,     -- deg; body hint saturates here
     BODY_MIN_DELTA   = 8,      -- deg; below = no hint
     BODY_SANE_DELTA  = 110,    -- deg; model yaw further than this from eye yaw = invalid sample
+    BODY_EVERY       = 2,      -- fresh updates between hitbox reads per player
     FS_OFFSET        = 26,     -- u; lateral offset for freestanding traces
+    FS_EVERY         = 4,      -- fresh updates between freestanding traces per player
     FACE_ANGLE       = 35,     -- deg; eye yaw this close to "at target" = probably aiming, not AA
     FACE_SCALE       = 0.3,    -- desync multiplier while facing us
     SPIN_LEAD        = 0.5,    -- updates of spin extrapolation (Jitter / Spin mode)
     REVEAL_TIME      = 0.04,   -- s; skip samples right after the enemy fired (yaw snaps to his aim)
     SHOT_DEDUPE      = 0.10,   -- s; min interval between pending shots on the same target
+    LC_DIST_SQR      = 4096,   -- u^2; origin jump above 64 u between updates = LC break
+    LC_HOLD          = 1.0,    -- s; LC flag stays this long after the last break
+    SPREAD_BLAME     = 5.0,    -- u; spread cone radius at target distance above this blames spread
     PURGE_AFTER      = 90,     -- s; drop records not seen for this long
     PENDING_MAX      = 32,     -- max outstanding shots
     DB_MAX           = 64,     -- persisted players
@@ -150,100 +187,130 @@ local C = {                    -- resolver
     HIT_CONF_GAIN    = 0.30,
     PARTIAL_GAIN     = 0.40,   -- share of HIT_CONF_GAIN for a body hit while aiming the head
     MISS_CONF_LOSS   = 0.20,
+    SOFT_CONF_LOSS   = 0.05,   -- conf loss for misses not blamed on the resolver
     ROUND_CONF_DECAY = 0.85,
+    JIT_PRED_CONF    = 0.6,    -- min share of regular runs to trust the jitter phase prediction
+    JIT_MAX_PERIOD   = 8,      -- updates; longer holds are not treated as periodic jitter
+    LC_FREEZE        = 0.2,    -- s; history is frozen this long after an LC break (Hold on LC break)
+    MODE_CONFIRM     = 2,      -- consecutive classifications before the AA class switches
+    HW_MIN = 0.4, HW_MAX = 1.6, HW_GAIN = 0.04, HW_LOSS = 0.06,   -- hint reliability bounds / steps
     FEED_LIFE        = 5.0,    -- s; event feed line lifetime
     FEED_MAX         = 6,
 }
 
-local K = {                    -- ragebot assist
-    EVAL_TICKS = 4,            -- target / lethality re-evaluation period, ticks
+local K = {                    -- ragebot assist / runtime
+    EVAL_TICKS   = 4,          -- target / lethality re-evaluation period, ticks
     VERIFY_TICKS = 16,         -- config cross-check period, ticks
     WEAPON_TICKS = 64,         -- weapon class re-check period, ticks
-    HK_INTERVAL = 1.0,         -- housekeeping period, s
-    SAVE_DELAY = 1.5,          -- autosave delay after the last menu change, s
+    HK_INTERVAL  = 1.0,        -- housekeeping period, s
+    SAVE_DELAY   = 1.5,        -- autosave delay after the last menu change, s
     JOURNAL_LAZY = 15,         -- s of silence before stale journal entries are dropped from disk
-    IO_RETRY = 5,              -- pause after a failed disk write, s
-    CM_TIMEOUT = 0.5,          -- createmove silent longer than this -> ragebot values are restored, s
+    IO_RETRY     = 5,          -- pause after a failed disk write, s
+    CM_TIMEOUT   = 0.5,        -- createmove silent longer than this -> ragebot values restored, s
     PAINT_TIMEOUT = 2,         -- paint silent longer than this -> createmove runs background tasks, s
-    MAX_CANDS = 48,            -- path candidates per parameter
-    MAX_TARGETS = 3,           -- closest-to-crosshair targets to trace
-    HOLD_TICKS = 12,           -- body-aim decision hold (anti flicker)
-    MOVE_EPS = 5,              -- "moving" threshold, u/s
-    T_MOVE_SQR = 1600,         -- target "running" above 40 u/s (squared)
-    BAD_LIMIT = 3,             -- consecutive write failures before a path is disabled
-    MISM_LIMIT = 3,            -- consecutive foreign overwrites before a path is disabled
-    ERR_LIMIT = 25,            -- consecutive callback errors before suspension
+    MAX_CANDS    = 48,         -- path candidates per parameter
+    MAX_TARGETS  = 3,          -- closest-to-crosshair targets to trace
+    HOLD_TICKS   = 12,         -- body-aim decision hold (anti flicker)
+    MOVE_EPS     = 5,          -- "moving" threshold, u/s
+    T_MOVE_SQR   = 1600,       -- target "running" above 40 u/s (squared)
+    BAD_LIMIT    = 3,          -- consecutive write failures before a path is disabled
+    MISM_LIMIT   = 3,          -- consecutive foreign overwrites before a path is disabled
+    ERR_LIMIT    = 25,         -- consecutive callback errors before suspension
     ERR_COOLDOWN = 5,          -- suspension length, s
-    ERR_STRIKES = 3,           -- suspensions before a full stop
-    ERR_FORGIVE = 60,          -- s without errors after which strikes are forgotten
-    EYE_OFFSET = 46,           -- aim point height above the target origin
-    HB_TTL = 256,              -- hitbox id cache lifetime, ticks
-    HB_MAX = 64,
-    GRAVITY = 800,
-    SIM_MARGIN = 16,
-    MEMO_MAX = 512,
+    ERR_STRIKES  = 3,          -- suspensions before a full stop
+    ERR_FORGIVE  = 60,         -- s without errors after which strikes are forgotten
+    EYE_OFFSET   = 46,         -- aim point height above the target origin
+    HB_TTL       = 256,        -- hitbox id cache lifetime, ticks
+    HB_MAX       = 64,
+    GRAVITY      = 800,
+    SIM_MARGIN   = 16,
+    MEMO_MAX     = 512,
     HG_HEAD = 1, HG_CHEST = 2, HG_STOMACH = 3,
-    FL_DUCKING = 2,
-    BTN_SPEED = (buttons and buttons.speed) or 65536,
+    FL_DUCKING   = 2,
+    BTN_SPEED    = (buttons and buttons.speed) or 65536,
+    BTN_ATTACK   = (buttons and buttons.attack) or 1,
+    BTN_ATTACK2  = (buttons and buttons.attack2) or 2048,
+    BTN_USE      = (buttons and buttons.use) or 32,
+    MT_NOCLIP = 7, MT_LADDER = 9,   -- MoveType_t values reported by engine.post_state().move_type
+    DEF_REVOLVER = 64,
+    AA_SCAN_TICKS = 4,              -- at-target / anti-backstab / freestanding refresh period
+    AA_FS_OFFSET  = 28,             -- u; lateral offset of the freestanding traces
+    AA_FAIL_LIMIT = 20,             -- consecutive rejected angle writes before the anti-aim stops
+    VK_LBUTTON   = 1,
 }
 
 local BRUTE = { 1.0, -1.0, 0.5, -0.5, 0.0, 0.75, -0.75 }   -- x max desync; index 1 is the trusted guess
-local BRUTE_N = #BRUTE
-local STEP_SEQ = { 0, 1, -1, 2, -2 }                        -- x brute step (customresolver pattern)
-local STEP_N = #STEP_SEQ
+local STEP_SEQ = { 0, 1, -1, 2, -2 }                        -- x brute step
+-- Jitter model candidates (x half range, toward the predicted side): index 1 is the trusted guess.
+local JIT_SEQ = { [1] = { 0, 1, -1, 0.5, -0.5 }, [2] = { 1, -1, 0, 0.5, -0.5 } }
 
-local MODE_ADAPTIVE, MODE_STATIC, MODE_BRUTE, MODE_JITSPIN, MODE_OFFSET = 1, 2, 3, 4, 5
-local BASE_AUTO, BASE_EYE, BASE_TARGET = 1, 2, 3
-local PITCH_OFF, PITCH_CLAMP, PITCH_AUTO, PITCH_DOWN, PITCH_ZERO, PITCH_UP = 1, 2, 3, 4, 5, 6
-local PAT_MULT, PAT_STEP = 1, 2
-
-local STAGE_LAGCOMP = (stage and stage.lagcomp) or 6
-local STAGE_NET_END = (stage and stage.net_update_end) or 7
-local MASK_VISIBLE  = (trace and trace.mask and trace.mask.visible) or 1847299
-local EYE_CLASSES   = { "C_CSPlayerPawn", "C_CSPlayerPawnBase", "CCSPlayerPawn" }
-local MODE_LABEL    = { static = "STATIC", sway = "SWAY", jitter = "JITTER", spin = "SPIN", random = "RANDOM" }
+-- Enumerations (one table: fewer main-chunk locals, no accidental globals).
+local E = {
+    MODE_ADAPTIVE = 1, MODE_STATIC = 2, MODE_BRUTE = 3, MODE_JITSPIN = 4, MODE_OFFSET = 5,
+    JIT_CENTER = 1, JIT_PREDICT = 2, JIT_FOLLOW = 3,
+    BASE_AUTO = 1, BASE_EYE = 2, BASE_TARGET = 3,
+    PITCH_OFF = 1, PITCH_CLAMP = 2, PITCH_AUTO = 3, PITCH_DOWN = 4, PITCH_ZERO = 5, PITCH_UP = 6,
+    PAT_MULT = 1, PAT_STEP = 2,
+    STAGE_LAGCOMP = (stage and stage.lagcomp) or 6,
+    STAGE_NET_END = (stage and stage.net_update_end) or 7,
+    MASK_VISIBLE  = (trace and trace.mask and trace.mask.visible) or 1847299,
+}
+local EYE_CLASSES = { "C_CSPlayerPawn", "C_CSPlayerPawnBase", "CCSPlayerPawn" }
+local MODE_LABEL  = { static = "STATIC", sway = "SWAY", jitter = "JITTER", spin = "SPIN", random = "RANDOM" }
 
 local ST = { STAND = 1, SLOW = 2, MOVE = 3, DUCK = 4, AIR = 5, APEX = 6 }
 local ST_NAME = { "STAND", "WALK", "RUN", "DUCK", "AIR", "APEX" }
 
-local WPN_ITEMS = { "SSG 08", "AWP", "Auto snipers", "Deagle / R8", "Pistols", "Other" }
-local WPN_BY_DEF = {
-    [40] = 1, [9] = 2, [11] = 3, [38] = 3, [1] = 4, [64] = 4,
-    [2] = 5, [3] = 5, [4] = 5, [30] = 5, [32] = 5, [36] = 5, [61] = 5, [63] = 5,
+local WPN = {
+    ITEMS = { "SSG 08", "AWP", "Auto snipers", "Deagle / R8", "Pistols", "Other" },
+    BY_DEF = {
+        [40] = 1, [9] = 2, [11] = 3, [38] = 3, [1] = 4, [64] = 4,
+        [2] = 5, [3] = 5, [4] = 5, [30] = 5, [32] = 5, [36] = 5, [61] = 5, [63] = 5,
+    },
+    BY_NAME = {
+        { "ssg08", 1 }, { "awp", 2 }, { "g3sg1", 3 }, { "scar20", 3 }, { "deagle", 4 }, { "revolver", 4 },
+        { "elite", 5 }, { "fiveseven", 5 }, { "glock", 5 }, { "tec9", 5 }, { "hkp2000", 5 },
+        { "p250", 5 }, { "usp", 5 }, { "cz75", 5 },
+    },
+    NON_GUN = {
+        "knife", "bayonet", "grenade", "flashbang", "smoke", "molotov", "incgrenade", "decoy", "c4",
+        "taser", "healthshot", "fists", "melee", "axe", "hammer", "spanner", "tablet", "shield",
+        "breach", "bump", "inferno",
+    },
+    NON_GUN_DEF = { [31] = true, [41] = true, [42] = true, [57] = true, [59] = true, [69] = true,
+                    [70] = true, [72] = true, [74] = true, [75] = true, [76] = true, [78] = true, [85] = true },
 }
-local WPN_BY_NAME = {
-    { "ssg08", 1 }, { "awp", 2 }, { "g3sg1", 3 }, { "scar20", 3 }, { "deagle", 4 }, { "revolver", 4 },
-    { "elite", 5 }, { "fiveseven", 5 }, { "glock", 5 }, { "tec9", 5 }, { "hkp2000", 5 },
-    { "p250", 5 }, { "usp", 5 }, { "cz75", 5 },
-}
-local NON_GUN = {
-    "knife", "bayonet", "grenade", "flashbang", "smoke", "molotov", "decoy", "c4", "taser",
-    "healthshot", "fists", "melee", "axe", "hammer", "spanner", "tablet", "shield", "breach", "bump",
-}
-local NON_GUN_DEF = { [31] = true, [41] = true, [42] = true, [57] = true, [59] = true, [69] = true,
-                      [70] = true, [72] = true, [74] = true, [75] = true, [76] = true, [78] = true, [85] = true }
-for d = 43, 49 do NON_GUN_DEF[d] = true end
-for d = 500, 526 do NON_GUN_DEF[d] = true end
+for d = 43, 49 do WPN.NON_GUN_DEF[d] = true end
+for d = 500, 526 do WPN.NON_GUN_DEF[d] = true end
+
+function WPN.non_gun_name(name)
+    if type(name) ~= "string" or name == "" then return false end
+    local l = s_lower(name)
+    for i = 1, #WPN.NON_GUN do
+        if s_find(l, WPN.NON_GUN[i], 1, true) then return true end
+    end
+    return false
+end
 
 -- ----------------------------------------------------------------------------
 -- Shared runtime state
 -- ----------------------------------------------------------------------------
 local STATE = {
-    now = 0, rt = 0,                       -- realtime snapshot for the current callback
+    rt = 0,                                -- realtime snapshot for the current callback
     insecure = false,
     menu_open = false, menu_evt_t = -1e9, menu_poll_t = -1e9,
     cmd_angles = nil,                      -- angles actually sent (silent aim aware)
-    lp_air = false, lp_moving = false,     -- local state for shot bookkeeping
+    lp_air = false, lp_moving = false,     -- local movement, refreshed every createmove
     sw = 0, sh = 0,
     failed = false, suspend_until = nil, strikes = 0, strike_t = 0, errs = {},
     rep_last = nil, rep_t = -100,
     last_label = 0,
+    flip_prev = false,
 }
 
--- Module tables (filled in below). Keeping functions in tables keeps every closure far
--- below the 60-upvalue limit of LuaJIT.
-local RES, RB, VIS, ACT = {}, {}, {}, {}
-local Bind, Journal = {}, {}
+-- Module tables. Keeping functions in tables keeps every closure far below the 60-upvalue
+-- limit of LuaJIT and the main chunk far below 200 locals.
+local RES, RB, VIS, ACT, Bind, Journal, IO, ESPX, AA = {}, {}, {}, {}, {}, {}, {}, {}, {}
 
 local function report(where, err)
     local msg = tostring(err)
@@ -253,29 +320,39 @@ local function report(where, err)
     end
 end
 
--- ----------------------------------------------------------------------------
--- Menu: registry, constructors, snapshot
--- ----------------------------------------------------------------------------
+-- ============================================================================
+--  MENU: registry, fault-tolerant constructors, snapshot
+-- ============================================================================
 local UI, REG, ORDER, CFG = {}, {}, {}, {}
 local MENU = { combo_base = nil, last = -1e9, built = false }
 local SET = { dirty = false, dirty_t = 0, io_t = -1e9 }
 local PS = { last = nil, sync = true, applying = false }
+local PATHS_USER = { hc = {}, dmg = {}, safe = {}, baim = {}, hitbox = {} }   -- from snapshots
 
 -- A failed element must not take the script down: it is replaced by an inert stand-in.
+-- Stand-ins are tracked in a side table: API objects are never probed for unknown fields.
+local DUMMY = setmetatable({}, { __mode = "k" })
+local function is_dummy(el) return el == nil or DUMMY[el] == true end
+
 local function dummy_el(def)
-    local d = { dummy = true }
+    local d = {}
+    DUMMY[d] = true
     d.get = function() return def end
     d.set = function() end
     d.depends = function() return d end
     d.tooltip = function() return d end
-    d.visible = function() return d end
+    d.callback = function() return d end
+    d.visible = function() return false end
     d.active = function() return false end
     return d
 end
 
 local function create(g, ctor, id, def, ...)
+    if type(ctor) ~= "function" then
+        return dummy_el(def)
+    end
     local ok, el = pcall(ctor, g, ...)
-    if not ok or not el then
+    if not ok or el == nil then
         say("menu element '" .. tostring(id) .. "' not created: " .. tostring(el))
         el = dummy_el(def)
     end
@@ -286,12 +363,13 @@ local function reg(id, kind, el, def, lo, hi, items, tip)
     REG[id] = { id = id, kind = kind, el = el, def = def, lo = lo, hi = hi, items = items }
     ORDER[#ORDER + 1] = id
     UI[id] = el
-    if tip and not el.dummy then pcall(el.tooltip, el, tip) end
+    if tip and not is_dummy(el) then pcall(el.tooltip, el, tip) end
     return el
 end
 
+-- Combo items are 1-based everywhere in this script; the widget base (0 or 1) is detected once.
 local function set_combo(el, items, idx1)
-    if el.dummy then return end
+    if is_dummy(el) then return end
     local v = safe(el.get, el)
     if type(v) == "string" then
         pcall(el.set, el, items[idx1])
@@ -312,18 +390,19 @@ local function combo_index(el, items)
     return nil
 end
 
-local function chk(g, id, name, def, tip)
+local W = {}   -- widget constructors
+
+function W.chk(g, id, name, def, tip)
     return reg(id, "check", create(g, g.checkbox, id, def, name, def), def, nil, nil, nil, tip)
 end
 
-local function sld(g, id, name, lo, hi, def, fmt, tip)
+function W.sld(g, id, name, lo, hi, def, fmt, tip)
     return reg(id, "slider", create(g, g.slider_int, id, def, name, lo, hi, def, fmt or "%d"), def, lo, hi, nil, tip)
 end
 
--- Combo items are 1-based everywhere in this script; the widget base (0 or 1) is detected once.
-local function cmb(g, id, name, items, def1, tip)
+function W.cmb(g, id, name, items, def1, tip)
     local el = create(g, g.combo, id, def1, name, items)
-    if not el.dummy then
+    if not is_dummy(el) then
         local v = safe(el.get, el)
         if MENU.combo_base == nil and type(v) == "number" then
             MENU.combo_base = (v == 0) and 0 or 1
@@ -333,23 +412,23 @@ local function cmb(g, id, name, items, def1, tip)
     return reg(id, "combo", el, def1, 1, #items, items, tip)
 end
 
-local function clr(g, id, name, def, tip)
+function W.clr(g, id, name, def, tip)
     return reg(id, "color", create(g, g.color, id, def, name, def, true), def, nil, nil, nil, tip)
 end
 
-local function key(g, id, name, tip)
+function W.key(g, id, name, tip)
     return reg(id, "key", create(g, g.keybind, id, false, name, 0), false, nil, nil, nil, tip)
 end
 
-local function mcb(g, id, name, items, defs, tip)
+function W.mcb(g, id, name, items, defs, tip)
     return reg(id, "multi", create(g, g.multi_combo, id, defs, name, items, defs), defs, nil, nil, items, tip)
 end
 
-local function lbl(g, text)
+function W.lbl(g, text)
     return create(g, g.label, "label", nil, text)
 end
 
-local function btn(g, id, name, act, tip)
+function W.btn(g, id, name, act, tip)
     local el = create(g, g.button, id, nil, name, function()
         local f = ACT[act]
         if not f then return end
@@ -357,14 +436,14 @@ local function btn(g, id, name, act, tip)
         local ok, err = pcall(f)
         if not ok then report("button " .. act, err) end
     end)
-    if tip and not el.dummy then pcall(el.tooltip, el, tip) end
+    if tip and not is_dummy(el) then pcall(el.tooltip, el, tip) end
     return el
 end
 
-local function div(g, text) pcall(g.divider, g, text) end
+function W.div(g, text) if type(g.divider) == "function" then pcall(g.divider, g, text) end end
 
-local function dep(el, other)
-    if el.dummy or other.dummy then return el end
+function W.dep(el, other)
+    if is_dummy(el) or is_dummy(other) then return el end
     pcall(el.depends, el, other)
     return el
 end
@@ -385,18 +464,27 @@ local function multi_on(v, idx, items)
 end
 
 local function bind_on(el)
-    if el == nil or el.dummy then return false end
+    if el == nil or is_dummy(el) then return false end
     local ok, v = pcall(el.active, el)
     return ok and v == true
 end
 
-local MODE_ITEMS    = { "Adaptive", "Static side", "Bruteforce", "Jitter / Spin", "Static offset" }
-local BASE_ITEMS    = { "Auto", "Eye yaw", "At target" }
-local PITCH_ITEMS   = { "Off", "Clamp", "Auto", "Force down", "Force zero", "Force up" }
-local BRUTE_ITEMS   = { "Multipliers", "Stepped" }
-local OVERLAY_ITEMS = { "Compact", "Detailed" }
-local PRESET_ITEMS  = { "Custom", "Balanced", "Aggressive", "Conservative" }
-local AIR_ITEMS     = { "Ground + vertical speed", "Ground flag only", "Landing prediction" }
+local ITEMS = {
+    MODE    = { "Adaptive", "Static side", "Bruteforce", "Jitter / Spin", "Static offset" },
+    JIT     = { "Center", "Predict next", "Follow last" },
+    BASE    = { "Auto", "Eye yaw", "At target" },
+    PITCH   = { "Off", "Clamp", "Auto", "Force down", "Force zero", "Force up" },
+    BRUTE   = { "Multipliers", "Stepped" },
+    OVERLAY = { "Compact", "Detailed" },
+    PRESET  = { "Custom", "Balanced", "Aggressive", "Conservative" },
+    AIR     = { "Ground + vertical speed", "Ground flag only", "Landing prediction" },
+    AA_STATE = { "Shared", "Standing", "Walking", "Running", "Ducking", "Air" },
+    AA_PITCH = { "Off", "Down", "Up", "Zero", "Custom" },
+    AA_BASE  = { "Local view", "At target" },
+    AA_MOD   = { "Off", "Center jitter", "Offset jitter", "3-way", "5-way", "Spin", "Sway", "Random" },
+    AA_FIX   = { "Engine (rotate_movement)", "Manual (set_move)", "Off" },
+    AA_TGT   = { "Closest to crosshair", "Nearest" },
+}
 
 local PRESETS = {
     [2] = { name = "Balanced", air_hc = 70, apex_hc = 58, air_dmg = 50, hc_stand = 70, hc_slow = 65, hc_move = 55,
@@ -422,6 +510,7 @@ local function mk_tab(name)
 end
 
 local function mk_group(tab, name)
+    if type(tab.group) ~= "function" then return {} end
     local ok, g = pcall(tab.group, tab, name)
     if not ok or not g then
         say("group '" .. name .. "' not created: " .. tostring(g))
@@ -431,46 +520,56 @@ local function mk_group(tab, name)
 end
 
 local function build_menu()
+    local chk, sld, cmb, clr, key, mcb, lbl, btn, div, dep = W.chk, W.sld, W.cmb, W.clr, W.key, W.mcb, W.lbl, W.btn, W.div, W.dep
     -- ---------------------------------------------------------------- tab 1
     local tab = mk_tab("0x Resolver")
 
     local g = mk_group(tab, "Resolver")
     local enable = chk(g, "enable", "Enable resolver", true, "Master switch of the resolver. The ragebot assist has its own switch on the 0x Ragebot tab.")
     dep(chk(g, "apply", "Override eye angles", true, "Writes the resolved angles into m_angEyeAngles every net update.\nRequires Allow Insecure; without it the resolver only tracks."), enable)
-    dep(cmb(g, "mode", "Mode", MODE_ITEMS, MODE_ADAPTIVE,
+    dep(cmb(g, "mode", "Mode", ITEMS.MODE, E.MODE_ADAPTIVE,
         "Adaptive: all hints + learning + brute cycling.\nStatic side: learned side only.\nBruteforce: cycle the pattern on misses.\nJitter / Spin: jitter -> center, spin -> extrapolated yaw.\nStatic offset: yaw relative to you (Yaw offset)."), enable)
     dep(sld(g, "desync", "Max desync", 0, 90, 58, "%d°", "Desync amount applied to the base yaw."), enable)
     dep(sld(g, "yaw_off", "Yaw offset", -180, 180, 0, "%d°", "Static offset mode: resolved yaw = (yaw towards you) + offset."), enable)
-    dep(cmb(g, "brute_pat", "Brute pattern", BRUTE_ITEMS, PAT_MULT, "Multipliers: 1, -1, 0.5, -0.5, 0, 0.75, -0.75 x max desync.\nStepped: 0, +1, -1, +2, -2 x brute step."), enable)
+    dep(cmb(g, "brute_pat", "Brute pattern", ITEMS.BRUTE, E.PAT_MULT, "Multipliers: 1, -1, 0.5, -0.5, 0, 0.75, -0.75 x max desync.\nStepped: 0, +1, -1, +2, -2 x brute step."), enable)
     dep(sld(g, "brute_step", "Brute step", 5, 90, 30, "%d°", "Step of the Stepped pattern."), enable)
-    dep(cmb(g, "base", "Yaw base", BASE_ITEMS, BASE_AUTO, "Auto: spin -> at target, jitter -> center, otherwise eye yaw."), enable)
-    dep(cmb(g, "pitch", "Pitch", PITCH_ITEMS, PITCH_AUTO, "Auto resolves fake pitch flicker to down and clamps the rest."), enable)
+    dep(cmb(g, "base", "Yaw base", ITEMS.BASE, E.BASE_AUTO, "Auto: spin -> at target, jitter -> center, otherwise eye yaw."), enable)
+    dep(cmb(g, "pitch", "Pitch", ITEMS.PITCH, E.PITCH_AUTO, "Auto resolves fake pitch flicker to down and clamps the rest."), enable)
     dep(sld(g, "move_sc", "Moving correction", 0, 100, 35, "%d%%", "Share of the desync applied while the enemy moves."), enable)
     dep(sld(g, "jit_sc", "Jitter correction", 0, 100, 50, "%d%%", "Share of the desync applied on top of the jitter center."), enable)
+    dep(cmb(g, "jit_mode", "Jitter handling", ITEMS.JIT, E.JIT_CENTER,
+        "Center: aim at the middle of both jitter angles; a resolver miss steps to the predicted angle, then to the other one.\nPredict next: start at the angle the NEXT update is expected to have (both angles and the switch period are learned; irregular patterns fall back to Center).\nFollow last: use the last received yaw."), enable)
     dep(chk(g, "face_damp", "Facing-target damping", true, "An eye yaw within 35° of you usually means he is aiming, not anti-aiming: desync is scaled down."), enable)
+    key(g, "k_flip", "Flip target side", "Press (hold mode recommended): inverts the learned side of the crosshair target.")
 
     local gi = mk_group(tab, "Intelligence")
     dep(chk(gi, "body", "Body yaw hint", true, "Estimates lower/upper body yaw from hitbox geometry."), enable)
     dep(chk(gi, "freestand", "Freestanding hint", true, "Traces cover left/right of the head; freestanding AA hides toward cover."), enable)
     dep(chk(gi, "move_mem", "Movement memory", true, "Remembers the last movement yaw for a second after the enemy stops."), enable)
     dep(chk(gi, "move_dir", "Side from movement direction", true, "While running, the side is hinted by the movement direction relative to you."), enable)
+    dep(chk(gi, "lc_detect", "Lag-compensation watch", true, "Teleports and simulation-time rewinds (defensive / shifting) flag the target as LC-broken:\nmisses on it do not step the brute table and the ragebot assist treats it as unresolved."), enable)
+    dep(chk(gi, "lc_hold", "Hold on LC break", true, "For 0.2 s after a lag-compensation break the yaw history is frozen and the last stable angles stay applied\n(angles received during a defensive tick are not his real anti-aim)."), enable)
+    dep(chk(gi, "hint_learn", "Hint reliability learning", true, "Confirmed hits and resolver misses re-weight the body / freestanding / movement hints for this session."), enable)
     local feedback = dep(chk(gi, "feedback", "Hit / miss learning", true, "weapon_fire + player_hurt feedback drives side confidence and brute cycling."), enable)
     dep(sld(gi, "miss_win", "Miss window", 150, 1000, 350, "%d ms", "A shot without player_hurt within this window counts as a miss."), feedback)
-    dep(sld(gi, "miss_tol", "Misses before step", 1, 3, 1, nil, "Consecutive misses on a standing target before the brute index steps."), feedback)
+    dep(sld(gi, "miss_tol", "Misses before step", 1, 3, 1, nil, "Consecutive resolver misses on a standing target before the brute index steps."), feedback)
+    dep(chk(gi, "spread_blame", "Ignore spread misses", true, "A miss with a spread cone wider than the head at that distance is blamed on spread, not on the resolver."), feedback)
     dep(chk(gi, "body_partial", "Body hit = partial", true, "A body hit while the ragebot was not forcing body-aim gives reduced confidence and does not lock the brute index."), feedback)
     dep(chk(gi, "anti_ab", "Detect anti-bruteforce", true, "If the target flips his side after every hit, the next prediction flips with him."), feedback)
-    dep(chk(gi, "flip_on_hurt", "Flip side when they hit you", false, "customresolver behaviour: invert the learned side of an enemy who just hit you."), feedback)
+    dep(chk(gi, "flip_on_hurt", "Flip side when they hit you", false, "Invert the learned side of an enemy who just hit you."), feedback)
     dep(chk(gi, "persist", "Persist learning (db)", true, "Keeps learned sides per SteamID between sessions."), feedback)
 
     local gv = mk_group(tab, "Visuals")
     dep(chk(gv, "overlay", "Player overlay", true, "AA class, side and desync above every tracked enemy."), enable)
-    dep(cmb(gv, "ov_style", "Overlay style", OVERLAY_ITEMS, 1, "Detailed adds confidence bar, hits / misses, brute index and pitch class."), enable)
+    dep(cmb(gv, "ov_style", "Overlay style", ITEMS.OVERLAY, 1, "Detailed adds confidence bar, hits / misses, brute index and pitch class."), enable)
     dep(chk(gv, "yaw_lines", "Yaw lines", true, "Short lines from the head: dim = received yaw, accent = resolved yaw."), enable)
-    chk(gv, "panel", "Status panel", true, "Panel with movement state, live ragebot overrides and the crosshair target's AA.\nDrag it with the mouse while the menu is open.")
+    dep(chk(gv, "esp_flag", "Native ESP flag", false, "Adds the AA class / side as a flag to the built-in player ESP (esp.add_text)."), enable)
+    chk(gv, "panel", "Status panel", true, "Movement state, live ragebot overrides and the crosshair target's AA.\nDrag it with the mouse while the menu is open.")
     sld(gv, "panel_x", "Panel X", 0, 100, 1, "%d%%")
     sld(gv, "panel_y", "Panel Y", 0, 100, 40, "%d%%")
     sld(gv, "panel_scale", "Panel scale", 80, 150, 100, "%d%%")
     chk(gv, "feed", "Event feed", true, "Hit / miss / brute events under the panel.")
+    chk(gv, "log_hits", "Log shots to console", false, "Prints every hit / miss with its classified reason to the Lua console.")
     clr(gv, "accent", "Accent color", color(140, 148, 255, 255), "Overlay, lines and panel accent.")
     chk(gv, "debug", "Debug panel", false, "Per-record internals and module state.")
 
@@ -479,6 +578,10 @@ local function build_menu()
     lbl(gd, "by 0x · " .. META.credits)
     chk(gd, "notif", "Notifications", true)
     chk(gd, "persist_ui", "Remember settings (db)", true, "Stores this menu in data\\db and restores it on load.")
+    btn(gd, "export", "Export settings", "export", "Writes data\\db\\0x_export.json, prints it to the console and copies it to the clipboard (Allow Insecure).")
+    btn(gd, "import_db", "Import data\\db\\0x_import.json", "import_db", "Loads a snapshot made by the web companion. Put the file into C:\\neverwin\\scripts\\data\\db.")
+    UI.import_text = create(gd, gd.text, "import_text", "", "Snapshot (paste)", "")
+    btn(gd, "import_text", "Import pasted snapshot", "import_text", "Applies the JSON snapshot pasted into the field above.")
     btn(gd, "reset_learn", "Clear learned data", "reset_learn", "Forget every learned side and the hit / miss statistics.")
     btn(gd, "reset_ui", "Reset settings to defaults", "reset_ui")
 
@@ -487,9 +590,9 @@ local function build_menu()
 
     local gm = mk_group(rtab, "Ragebot assist")
     local rb = chk(gm, "rb_enable", "Enable ragebot assist", true, "Drives hitchance, min damage, safepoint and hitboxes of your ragebot through config paths.\nEverything is restored on pause, death, weapon change and unload.")
-    dep(cmb(gm, "preset", "Preset", PRESET_ITEMS, 2, "Balanced is universal, Aggressive fires sooner, Conservative wants more certainty.\nEditing a value switches the preset to Custom."), rb)
+    dep(cmb(gm, "preset", "Preset", ITEMS.PRESET, 2, "Balanced is universal, Aggressive fires sooner, Conservative wants more certainty.\nEditing a value switches the preset to Custom."), rb)
     dep(chk(gm, "pause_menu", "Pause while menu is open", true, "Your values are restored while the Neverlose menu is open so you can edit the ragebot freely."), rb)
-    dep(mcb(gm, "weapons", "Weapon groups", WPN_ITEMS, { true, true, true, true, true, false }, "The assist only touches the ragebot while one of the selected groups is active."), rb)
+    dep(mcb(gm, "weapons", "Weapon groups", WPN.ITEMS, { true, true, true, true, true, false }, "The assist only touches the ragebot while one of the selected groups is active."), rb)
     dep(chk(gm, "log_cfg", "Log config writes", false, "Prints path, old and new value of every config write to the Lua console."), rb)
 
     local gb = mk_group(rtab, "Binds")
@@ -509,7 +612,7 @@ local function build_menu()
     dep(sld(ga, "apex_hc", "Apex hitchance", 1, 100, 58, "%d%%"), apex)
     dep(sld(ga, "apex_win", "Apex window", 10, 110, 42, "≤ %d u/s", "Apex while |vertical speed| is below this."), apex)
     div(ga, "Detection")
-    dep(cmb(ga, "air_mode", "Air detection", AIR_ITEMS, 1, "Ground + vertical speed ignores stairs. Ground flag only reacts fastest.\nLanding prediction restores ground values a few ticks before touchdown (engine.simulate)."), rb)
+    dep(cmb(ga, "air_mode", "Air detection", ITEMS.AIR, 1, "Ground + vertical speed ignores stairs. Ground flag only reacts fastest.\nLanding prediction restores ground values a few ticks before touchdown (engine.simulate)."), rb)
     dep(sld(ga, "air_thr", "Vertical speed threshold", 5, 220, 22, "%d u/s"), rb)
     dep(sld(ga, "land_ticks", "Landing lead", 1, 8, 3, "%d ticks"), rb)
 
@@ -523,7 +626,7 @@ local function build_menu()
     dep(sld(gc, "baim_fov", "Target search FOV", 5, 180, 60, "%d°", "Angle around the crosshair in which the target for corrections, damage cap and body-aim is searched."), rb)
     dep(sld(gc, "hc_tgt_air", "Target in air", -30, 30, -8, "%+d%%"), rb)
     dep(sld(gc, "hc_tgt_move", "Target running", -30, 30, 0, "%+d%%"), rb)
-    dep(sld(gc, "unres_hc", "Target unresolved", -30, 30, 8, "%+d%%", "Hitchance adjustment when the resolver has little trust in its guess for the target."), rb)
+    dep(sld(gc, "unres_hc", "Target unresolved", -30, 30, 8, "%+d%%", "Hitchance adjustment when the resolver has little trust in its guess or the target breaks lag compensation."), rb)
     dep(chk(gc, "dmg_cap", "Cap min damage at target HP", true, "A finishing shot is never blocked by a min damage above the target's HP."), rb)
 
     local gba = mk_group(rtab, "Body-aim")
@@ -533,12 +636,63 @@ local function build_menu()
     dep(sld(gba, "baim_margin", "Damage margin", 0, 30, 2, "%d HP"), baim)
     dep(chk(gba, "baim_hp_on", "Body at low HP", false), baim)
     dep(sld(gba, "baim_hp", "HP threshold", 1, 100, 40, "%d HP"), baim)
-    dep(chk(gba, "baim_unres", "Body when unresolved", true, "Resolver synergy: random / wide jitter targets with low confidence, repeated misses or a deep brute index get body-aim (reason RES)."), baim)
+    dep(chk(gba, "baim_unres", "Body when unresolved", true, "Resolver synergy: low-confidence random / wide jitter targets, repeated misses, a deep brute index or an LC break get body-aim (reason RES / LC)."), baim)
 
     local gl = mk_group(rtab, "Config link")
     UI.rb_status = lbl(gl, "Paths: scanning…")
     btn(gl, "rescan", "Rescan config", "rescan", "Find the ragebot paths in config.keys again.")
     btn(gl, "dump", "Dump paths to console", "dump", "Prints the discovered paths with their current values.")
+
+    -- ---------------------------------------------------------------- tab 3
+    local atab = mk_tab("0x Anti-Aim")
+
+    local gaa = mk_group(atab, "Anti-aim")
+    local aa = chk(gaa, "aa_on", "Enable anti-aim", false, "Writes pitch / yaw into the command in createmove (cmd:set_view_angles).\nNever active while you attack, hold a grenade / C4, use, or climb a ladder.")
+    dep(cmb(gaa, "aa_fix", "Movement fix", ITEMS.AA_FIX, 1, "Keeps WASD relative to your camera while the command yaw is turned.\nEngine: cmd:rotate_movement(camera yaw). Manual: the move vector is rotated in the script (cmd:set_move).\nIf you walk in the wrong direction, switch the mode."), aa)
+    dep(chk(gaa, "aa_fix_inv", "Manual fix: invert side axis", false, "Only for the Manual fix: enable if strafing is mirrored."), aa)
+    dep(chk(gaa, "aa_lock", "Lock angles", false, "Calls cmd:lock_angles() after the angles are written."), aa)
+    dep(cmb(gaa, "aa_target", "At-target picks", ITEMS.AA_TGT, 1, "Which enemy the At target yaw base and freestanding follow."), aa)
+    dep(chk(gaa, "aa_arrows", "Direction arrows", true, "Arrow next to the crosshair for a manual direction (accent) or freestanding (amber)."), aa)
+    btn(gaa, "aa_p1", "Preset: jitter backward", "aa_preset_jitter", "Shared condition: pitch down, at target, 180°, center jitter 60°.")
+    btn(gaa, "aa_p2", "Preset: static backward", "aa_preset_static", "Shared condition: pitch down, at target, 180°, no modifier.")
+    btn(gaa, "aa_p3", "Preset: spin", "aa_preset_spin", "Shared condition: pitch down, local view, spin 30°/tick.")
+
+    local gab = mk_group(atab, "Builder")
+    cmb(gab, "aa_edit", "Edit condition", ITEMS.AA_STATE, 1, "Shared is used for every condition without its own override.")
+    for i = 1, #ITEMS.AA_STATE do
+        local tag, p = ITEMS.AA_STATE[i] .. " · ", "aa" .. i .. "_"
+        if i > 1 then chk(gab, p .. "on", tag .. "override", false, "Use these values instead of Shared while " .. s_lower(ITEMS.AA_STATE[i]) .. ".") end
+        cmb(gab, p .. "pitch", tag .. "pitch", ITEMS.AA_PITCH, 2)
+        sld(gab, p .. "pitch_v", tag .. "custom pitch", -89, 89, 89, "%d°", "Used by the Custom pitch.")
+        cmb(gab, p .. "base", tag .. "yaw base", ITEMS.AA_BASE, 2, "At target falls back to the local view while no enemy is known.")
+        sld(gab, p .. "yaw", tag .. "yaw offset", -180, 180, 180, "%d°", "180 = backward.")
+        cmb(gab, p .. "mod", tag .. "yaw modifier", ITEMS.AA_MOD, 1, "Center jitter: ± range / 2. Offset jitter: 0 / + range. 3-way and 5-way step across the range.\nSpin and Sway use the speed. Random picks a new offset inside the range.")
+        sld(gab, p .. "range", tag .. "modifier range", 0, 180, 60, "%d°")
+        sld(gab, p .. "delay", tag .. "switch delay", 1, 16, 1, "%d ticks", "Ticks each jitter / way / random step is held.")
+        sld(gab, p .. "speed", tag .. "spin / sway speed", 1, 90, 20, "%d°/tick")
+    end
+
+    local gak = mk_group(atab, "Binds")
+    key(gak, "k_aa_left", "Manual left", "Yaw = camera + 90°. The most recently activated manual bind wins.")
+    key(gak, "k_aa_right", "Manual right", "Yaw = camera - 90°.")
+    key(gak, "k_aa_back", "Manual back", "Yaw = camera + 180°.")
+    key(gak, "k_aa_fwd", "Manual forward", "Yaw = camera.")
+    key(gak, "k_aa_fs", "Freestanding", "While active the yaw turns toward the side that is covered from the target.")
+    key(gak, "k_aa_off", "Disable while held", "Anti-aim is not applied while this bind is active.")
+
+    local gas = mk_group(atab, "Behaviour")
+    dep(chk(gas, "aa_fs_always", "Freestanding always on", false, "Freestanding without holding the bind."), aa)
+    dep(chk(gas, "aa_fs_static", "Freestanding disables modifier", true), aa)
+    dep(chk(gas, "aa_manual_static", "Manual yaw disables modifier", true), aa)
+    local knife = dep(chk(gas, "aa_knife", "Anti-backstab", true, "An enemy with a knife inside the distance below: face him so your back is not exposed."), aa)
+    dep(sld(gas, "aa_knife_dist", "Anti-backstab distance", 100, 400, 220, "%d u"), knife)
+    local hurt = dep(chk(gas, "aa_hurt", "Shuffle when hit", true, "Bullet damage taken: the jitter phase shifts and the yaw gets an extra offset whose sign flips with every hit."), aa)
+    dep(sld(gas, "aa_hurt_off", "Shuffle offset", 0, 45, 12, "%d°"), hurt)
+    dep(sld(gas, "aa_hurt_time", "Shuffle duration", 1, 10, 4, "%d s"), hurt)
+    dep(chk(gas, "aa_use", "Stand down on use (E)", true, "Defusing, doors and pickups need your real angles."), aa)
+    dep(chk(gas, "aa_freeze", "Stand down in freeze time", true), aa)
+    dep(chk(gas, "aa_warmup", "Stand down in warmup", false), aa)
+    dep(chk(gas, "aa_ladder", "Stand down on ladder / noclip", true, "Read from engine.post_state().move_type."), aa)
 
     MENU.built = true
 end
@@ -576,31 +730,44 @@ local function differs(kind, a, b)
     if kind == "color" and type(a) == "table" and type(b) == "table" then
         return a.r ~= b.r or a.g ~= b.g or a.b ~= b.b or a.a ~= b.a
     end
-    if kind == "multi" then return not same(a, b) end
+    if kind == "multi" then return not U.same(a, b) end
     return a ~= b
 end
 
+-- Converts a stored / imported value into a valid value for the element (nil = reject).
 local function validate(r, v)
     local k = r.kind
     if k == "check" then
         if type(v) == "boolean" then return v end
     elseif k == "slider" then
-        if type(v) == "number" then return clamp(floor(v + 0.5), r.lo, r.hi) end
+        v = tonumber(v)
+        if v then return clamp(floor(v + 0.5), r.lo, r.hi) end
     elseif k == "combo" then
-        if type(v) == "number" then return clamp(floor(v + 0.5), 1, #r.items) end
+        if type(v) == "string" then
+            for i = 1, #r.items do
+                if r.items[i] == v then return i end
+            end
+            return nil
+        end
+        v = tonumber(v)
+        if v then return clamp(floor(v + 0.5), 1, #r.items) end
     elseif k == "color" then
         if type(v) == "table" and type(v.r) == "number" and type(v.g) == "number" and type(v.b) == "number" then
-            return { r = v.r, g = v.g, b = v.b, a = tonumber(v.a) or 255 }
+            return { r = clamp(v.r, 0, 255), g = clamp(v.g, 0, 255), b = clamp(v.b, 0, 255), a = clamp(tonumber(v.a) or 255, 0, 255) }
         end
     elseif k == "multi" then
-        if type(v) == "table" then return v end
+        if type(v) == "table" then
+            local m = {}
+            for j = 1, #r.items do m[r.items[j]] = multi_on(v, j, r.items) end
+            return m
+        end
     end
     return nil
 end
 
 local function write_el(r, v)
     local el = r.el
-    if el.dummy then CFG[r.id] = v return end
+    if is_dummy(el) then CFG[r.id] = v return end
     local k = r.kind
     if k == "combo" then
         set_combo(el, r.items, v)
@@ -628,6 +795,11 @@ end
 
 local cfg_tick -- forward
 
+local function notify(msg)
+    if CFG.notif ~= false then pcall(client.notify, msg, META.name) end
+    say(msg)
+end
+
 local function apply_preset(idx)
     local p = PRESETS[idx]
     if not p then return end
@@ -640,11 +812,13 @@ local function apply_preset(idx)
     if CFG.notif then pcall(client.notify, "Preset \"" .. p.name .. "\" applied", META.name) end
 end
 
--- force = values came from load / reset / the preset itself: the preset is not re-applied on top.
+-- force = values came from load / reset / import / the preset itself: the preset is not
+-- re-applied on top of them.
 local function on_settings_changed(force)
     SET.dirty, SET.dirty_t = true, STATE.rt
     RB.eval_at = 0
     VIS.dirty = true
+    AA.sync_menu()
     if not REG.preset then return end
     local p = CFG.preset
     if p ~= PS.last then
@@ -688,7 +862,27 @@ end
 local LEGACY_MAP = { enable = "rb_enable", debug = "log_cfg", ind_on = "panel", ind_x = "panel_x",
                      ind_y = "panel_y", ind_scale = "panel_scale", ind_color = "accent" }
 
-local function pack_settings()
+-- Manual paths (code constants + snapshot) as sanitized string lists.
+function IO.clean_paths(src)
+    local out = { hc = {}, dmg = {}, safe = {}, baim = {}, hitbox = {} }
+    if type(src) ~= "table" then return out end
+    for id, list in pairs(out) do
+        local s = src[id]
+        if type(s) == "string" then s = { s } end
+        if type(s) == "table" then
+            for i = 1, #s do
+                local p = s[i]
+                if type(p) == "string" then
+                    p = U.trim(p)
+                    if p ~= "" and #list < 16 then list[#list + 1] = p end
+                end
+            end
+        end
+    end
+    return out
+end
+
+function IO.pack()
     local t = {}
     for i = 1, #ORDER do
         local r = REG[ORDER[i]]
@@ -696,35 +890,34 @@ local function pack_settings()
         if k == "check" or k == "slider" or k == "combo" then
             t[r.id] = v
         elseif k == "color" and type(v) == "table" then
-            t[r.id] = { r = v.r, g = v.g, b = v.b, a = v.a }
+            t[r.id] = { r = floor(v.r), g = floor(v.g), b = floor(v.b), a = floor(v.a or 255) }
         elseif k == "multi" and type(v) == "table" then
             local m = {}
             for j = 1, #r.items do m[r.items[j]] = multi_on(v, j, r.items) end
             t[r.id] = m
         end
     end
-    return { v = 3, ver = META.version, persist = CFG.persist_ui ~= false, s = t }
+    local paths, any = {}, false
+    for id, list in pairs(PATHS_USER) do
+        if #list > 0 then paths[id], any = list, true end
+    end
+    return { v = META.schema, ver = META.version, persist = CFG.persist_ui ~= false, s = t, paths = any and paths or nil }
 end
 
-local function settings_save()
-    local ok, res = pcall(db.save, META.db_settings, pack_settings())
+function IO.save()
+    local ok, res = pcall(db.save, META.db_settings, IO.pack())
     return ok and res ~= false
 end
 
-local function settings_load()
-    local ok, data = pcall(db.load, META.db_settings, nil)
-    local legacy = false
-    if not ok or type(data) ~= "table" or type(data.s) ~= "table" then
-        ok, data = pcall(db.load, META.db_legacy, nil)
-        if not ok or type(data) ~= "table" or type(data.s) ~= "table" then return false end
-        legacy = true
-    end
-    if data.persist == false then return false end
+-- Writes a snapshot table into the menu. Returns the number of applied values or nil, reason.
+function IO.apply(data, legacy, only_persist)
+    if type(data) ~= "table" or type(data.s) ~= "table" then return nil, "not a 0x snapshot" end
     local n = 0
+    PS.applying = true
     for id, v in pairs(data.s) do
         local tid = legacy and (LEGACY_MAP[id] or id) or id
         local r = REG[tid]
-        if r and r.kind ~= "key" then
+        if r and r.kind ~= "key" and (not only_persist or tid == "persist_ui") then
             local val = validate(r, v)
             if val ~= nil then
                 write_el(r, val)
@@ -732,8 +925,97 @@ local function settings_load()
             end
         end
     end
-    if legacy and n > 0 then say("imported " .. n .. " settings from the s1 snapshot") end
+    PS.applying = false
+    if only_persist and REG.persist_ui then write_el(REG.persist_ui, false) end
+    if type(data.paths) == "table" then PATHS_USER = IO.clean_paths(data.paths) end
+    return n
+end
+
+function IO.load()
+    local ok, data = pcall(db.load, META.db_settings, nil)
+    local legacy, src = false, "v4"
+    if not ok or type(data) ~= "table" or type(data.s) ~= "table" then
+        ok, data = pcall(db.load, META.db_settings_v3, nil)
+        src = "v3"
+        if not ok or type(data) ~= "table" or type(data.s) ~= "table" then
+            ok, data = pcall(db.load, META.db_legacy, nil)
+            if not ok or type(data) ~= "table" or type(data.s) ~= "table" then return false end
+            legacy, src = true, "s1"
+        end
+    end
+    -- The user opted out of remembering settings: keep only that choice (v3 forgot it).
+    if data.persist == false then
+        IO.apply(data, legacy, true)
+        return false
+    end
+    local n = IO.apply(data, legacy, false) or 0
+    if src ~= "v4" and n > 0 then
+        say("imported " .. n .. " settings from the " .. src .. " snapshot")
+        SET.migrated = true
+    end
     return n > 0
+end
+
+-- Applies an external snapshot (import) and makes it permanent.
+function IO.import(data, origin)
+    if type(data) ~= "table" then
+        notify("Import failed (" .. origin .. "): not a JSON object")
+        return
+    end
+    local n, why = IO.apply(data, false, false)
+    if not n then
+        notify("Import failed (" .. origin .. "): " .. tostring(why))
+        return
+    end
+    PS.last = nil
+    cfg_tick(true)
+    SET.dirty, SET.dirty_t = true, -1e9
+    if type(data.paths) == "table" then ACT.rescan() end
+    notify(format("Imported %d settings from %s", n, origin))
+end
+
+function ACT.export()
+    local snap = IO.pack()
+    local ok, text = pcall(json.encode, snap)
+    if not ok or type(text) ~= "string" then
+        notify("Export failed: " .. tostring(text))
+        return
+    end
+    local saved = safe(db.save, META.db_export, snap) ~= false
+    say("snapshot: " .. text)
+    local clip = false
+    if safe(client.insecure) == true and utils and utils.clipboard_set then
+        clip = pcall(utils.clipboard_set, text)
+    end
+    notify(format("Exported%s%s", saved and " to data\\db\\0x_export.json" or "", clip and " · copied to clipboard" or " · see console"))
+end
+
+function ACT.import_db()
+    local ok, data = pcall(db.load, META.db_import, nil)
+    if not ok or data == nil then
+        notify("data\\db\\0x_import.json not found or not valid JSON")
+        return
+    end
+    IO.import(data, "0x_import.json")
+end
+
+function ACT.import_text()
+    local el = UI.import_text
+    local s = el and not is_dummy(el) and safe(el.get, el) or nil
+    if type(s) ~= "string" or U.trim(s) == "" then
+        notify("Paste a snapshot into the field first")
+        return
+    end
+    s = U.trim(s)
+    local brace = s_find(s, "{", 1, true)
+    if brace and brace > 1 then s = s_sub(s, brace) end   -- tolerate a "0x:" style prefix
+    local ok, data, err = pcall(json.decode, s)
+    if not ok or data == nil then
+        notify("Snapshot is not valid JSON: " .. tostring(ok and err or data))
+        return
+    end
+    IO.import(data, "pasted snapshot")
+    pcall(el.set, el, "")
 end
 
 function ACT.reset_ui()
@@ -745,31 +1027,38 @@ function ACT.reset_ui()
     PS.applying = false
     PS.last = nil
     cfg_tick(true)
-    if CFG.notif then pcall(client.notify, "Settings reset to defaults", META.name) end
+    notify("Settings reset to defaults")
 end
 
 -- ============================================================================
 --  RESOLVER
 -- ============================================================================
-local function notify(msg)
-    if CFG.notif ~= false then pcall(client.notify, msg, META.name) end
-    say(msg)
-end
-
 RES.records, RES.by_pawn, RES.pending, RES.store = {}, {}, {}, {}
 RES.insecure, RES.simtime_ok = false, true
 RES.body_ok, RES.body_good, RES.body_bad = true, 0, 0
-RES.last_purge, RES.total_hits, RES.total_misses, RES.total_shots = 0, 0, 0, 0
+RES.last_purge, RES.store_dirty = 0, false
+RES.stats = { shots = 0, hits = 0, heads = 0, misses = 0, resolver = 0, spread = 0, lagcomp = 0, moving = 0, airborne = 0, death = 0, lost = 0 }
+RES.hw = { b = 1, fs = 1, mv = 1, md = 1 }                    -- hint reliability (session)
+RES.runs = {}                                                 -- scratch: jitter run lengths
 RES.write_cls, RES.write_ok, RES.write_fails = nil, nil, 0   -- write_ok: nil unknown, true working, false disabled
 RES.focus = nil                                               -- record closest to the crosshair
+RES.fs_skip = {}
+RES.fs_opts = { skip = RES.fs_skip, mask = E.MASK_VISIBLE }
 
 -- ---------------------------------------------------------------- records
+-- SteamID for humans; controller address for bots (stable across respawns, unlike the pawn).
 function RES.player_key(ctrl, pawn)
     if ctrl then
         local sid = safe(ctrl.steam_id, ctrl)
         if type(sid) == "string" and sid ~= "" and sid ~= "0" then return sid, true end
+        local ca = safe(ctrl.address, ctrl)
+        if ca then return "c" .. tostring(ca), false end
     end
-    return "p" .. tostring(pawn:address()), false
+    if pawn then
+        local pa = safe(pawn.address, pawn)
+        if pa then return "p" .. tostring(pa), false end
+    end
+    return nil, false
 end
 
 function RES.new_record(key, is_sid)
@@ -780,19 +1069,24 @@ function RES.new_record(key, is_sid)
         pitch_jit = 0, p_avg = 0, pitch_kind = "",
         -- classification
         mode = "static", mode_conf = 0, center = 0, amp = 0, spin_rate = 0, mean_abs = 0, jit_alt = 0,
+        mode_cand = nil, mode_cnt = 0,
+        -- jitter model: cluster half range, switch period (updates), newest side and its run length
+        jit_half = 0, jit_period = 1, jit_pconf = 0, jit_side = 1, jit_run = 0, jit_k = nil,
         -- hints
-        body_delta = 0, fs_hint = 0, mv_hint = 0, md_hint = 0, score = 0,
+        body_delta = 0, body_ref = nil, b_hint = 0, fs_hint = 0, mv_hint = 0, md_hint = 0, score = 0, upd = 0,
         last_move_yaw = nil, last_move_t = 0, moving = false, speed = 0,
+        -- lag compensation
+        lc = false, lc_t = -1e9, last_origin = nil,
         -- learning
-        side = 1, conf = 0.3, pred_side = 1, brute_idx = 1,
+        side = 1, conf = 0.3, pred_side = 1, brute_idx = 1, manual = false,
         shots = 0, hits = 0, misses = 0, kills = 0, hit_streak = 0, miss_streak = 0,
-        last_hit_t = 0, last_miss_t = 0, last_shot_t = -1e9, reveal_t = -1e9,
+        last_shot_t = -1e9, reveal_t = -1e9, last_reason = nil,
         prev_result = nil, hit_side = 0, ab_score = 0, ab_flips = 0, preflipped = false,
         -- output
         at_target = 0, raw_yaw = 0, raw_pitch = 0, amount = 0,
         resolved_yaw = 0, resolved_pitch = 0, resolved = false, applied = false,
         -- bookkeeping
-        sim_time = nil, last_tick = -1, seen_rt = 0, pawn = nil, pawn_addr = nil, en_eye = nil,
+        sim_time = nil, last_tick = -1, seen_rt = -1e9, pawn = nil, pawn_addr = nil, en_eye = nil,
     }
     local saved = (is_sid and CFG.persist) and RES.store[key] or nil
     if type(saved) == "table" then
@@ -804,15 +1098,15 @@ function RES.new_record(key, is_sid)
     return rec
 end
 
-function RES.get_record(ctrl, pawn)
+function RES.get_record(ctrl, pawn, addr)
     local key, is_sid = RES.player_key(ctrl, pawn)
+    if not key then return nil end
     local rec = RES.records[key]
     if not rec then
         rec = RES.new_record(key, is_sid)
         rec.name = (ctrl and safe(ctrl.name, ctrl)) or safe(pawn.name, pawn) or "?"
         RES.records[key] = rec
     end
-    local addr = pawn:address()
     if rec.pawn_addr ~= addr then
         if rec.pawn_addr and RES.by_pawn[rec.pawn_addr] == rec then RES.by_pawn[rec.pawn_addr] = nil end
         rec.pawn_addr = addr
@@ -828,9 +1122,17 @@ function RES.record_by_pawn(pawn)
     return addr and RES.by_pawn[addr] or nil
 end
 
+function RES.record_by_controller(ctrl)
+    if not ctrl then return nil end
+    local key = RES.player_key(ctrl, nil)
+    local rec = key and RES.records[key] or nil
+    return rec or RES.record_by_pawn(safe(ctrl.pawn, ctrl))
+end
+
 function RES.remember(rec)
     if not rec.is_sid then return end
     RES.store[rec.key] = { side = rec.side, conf = rec.conf, hits = rec.hits, misses = rec.misses, t = os.time() }
+    RES.store_dirty = true
 end
 
 function RES.store_load()
@@ -838,17 +1140,18 @@ function RES.store_load()
     RES.store = (type(data) == "table") and data or {}
 end
 
-function RES.store_save()
-    if not CFG.persist then return end
+function RES.store_save(force)
+    if not CFG.persist or (not RES.store_dirty and not force) then return end
     local list = {}
     for k, v in pairs(RES.store) do
-        if type(v) == "table" then list[#list + 1] = { k = k, t = tonumber(v.t) or 0 } end
+        if type(v) == "table" then list[#list + 1] = { k = k, t = tonumber(v.t) or 0 }
+        else RES.store[k] = nil end
     end
     if #list > C.DB_MAX then
         tsort(list, function(a, b) return a.t > b.t end)
         for i = C.DB_MAX + 1, #list do RES.store[list[i].k] = nil end
     end
-    safe(db.save, META.db, RES.store)
+    if safe(db.save, META.db, RES.store) ~= false then RES.store_dirty = false end
 end
 
 -- ---------------------------------------------------------------- history + classification
@@ -880,8 +1183,51 @@ function RES.circular_mean(rec)
         local a = rad(rec.yaws[i])
         sx, sy = sx + cos(a), sy + sin(a)
     end
-    if sx == 0 and sy == 0 then return rec.yaws[rec.head] end
+    if abs(sx) < 1e-6 and abs(sy) < 1e-6 then return rec.yaws[rec.head] end
     return normalize(deg(atan2(sy, sx)))
+end
+
+-- Two-angle jitter model: debiased center (midpoint of both clusters, not the sample mean),
+-- half range, switch period in updates and the run length of the newest side.
+function RES.jitter_model(rec)
+    local H, n, yaws, c0 = C.HISTORY, rec.n, rec.yaws, rec.center
+    local hs, hn, ls, ln = 0, 0, 0, 0
+    for i = 1, n do
+        local o = normalize(yaws[i] - c0)
+        if o >= 0 then hs, hn = hs + o, hn + 1 else ls, ln = ls + o, ln + 1 end
+    end
+    if hn == 0 or ln == 0 then
+        rec.jit_pconf = 0
+        return
+    end
+    local hi, lo = hs / hn, ls / ln
+    local center, half = normalize(c0 + (hi + lo) * 0.5), (hi - lo) * 0.5
+    rec.center, rec.jit_half, rec.amp = center, half, half
+
+    local idx = (n == H) and (rec.head % H + 1) or 1        -- oldest sample first
+    local side, run, runs, rn = 0, 0, RES.runs, 0
+    for _ = 1, n do
+        local sd = (normalize(yaws[idx] - center) >= 0) and 1 or -1
+        if sd == side then
+            run = run + 1
+        else
+            if side ~= 0 then rn = rn + 1 runs[rn] = run end
+            side, run = sd, 1
+        end
+        idx = idx % H + 1
+    end
+    local first = (rn >= 3) and 2 or 1                       -- the oldest run is cut by the window
+    local total = rn - first + 1
+    local best, best_n = 1, 0
+    for p = 1, C.JIT_MAX_PERIOD do
+        local cnt = 0
+        for i = first, rn do
+            if runs[i] == p then cnt = cnt + 1 end
+        end
+        if cnt > best_n then best, best_n = p, cnt end
+    end
+    rec.jit_period, rec.jit_side, rec.jit_run = best, side, run
+    rec.jit_pconf = (total >= 2) and (best_n / total) or 0
 end
 
 -- static / sway / jitter / spin / random from the delta window, plus a pitch class.
@@ -891,25 +1237,30 @@ function RES.classify(rec)
         rec.mode, rec.mode_conf = "static", 0
         return
     end
-    local H = C.HISTORY
+    local H, JMD = C.HISTORY, C.JITTER_MIN_DELTA
+    local old_mode = rec.mode
+    local small_sum, small_n = 0, 0
     local sum_abs, sum_signed, flips, big, prev_sign, alt, pairs_n = 0, 0, 0, 0, 0, 0, 0
     local prev_d
-    local idx = (dn == H) and (rec.dhead % H + 1) or 1
+    local idx = (dn == H) and (rec.dhead % H + 1) or 1      -- oldest delta first
+    local deltas = rec.deltas
     for _ = 1, dn do
-        local d = rec.deltas[idx]
+        local d = deltas[idx]
         local ad = abs(d)
         sum_abs, sum_signed = sum_abs + ad, sum_signed + d
-        if ad > C.JITTER_MIN_DELTA then
+        if ad > JMD then
             big = big + 1
             local s = (d > 0) and 1 or -1
             if prev_sign ~= 0 and s ~= prev_sign then flips = flips + 1 end
             prev_sign = s
+        else
+            small_sum, small_n = small_sum + ad, small_n + 1
         end
         if prev_d then
             pairs_n = pairs_n + 1
             local m = max(ad, abs(prev_d))
             -- two consecutive deltas of equal size and opposite sign = two-way jitter
-            if m > C.JITTER_MIN_DELTA * 0.5 and abs(d + prev_d) < max(4, 0.35 * m) then alt = alt + 1 end
+            if m > JMD * 0.5 and abs(d + prev_d) < max(4, 0.35 * m) then alt = alt + 1 end
         end
         prev_d = d
         idx = idx % H + 1
@@ -921,13 +1272,16 @@ function RES.classify(rec)
 
     if abs(mean_signed) > C.SPIN_MIN_RATE and big >= dn * 0.6 and flips <= 1 then
         rec.mode, rec.spin_rate, rec.mode_conf = "spin", mean_signed, min(1, big / dn)
-    elseif big >= dn * 0.4 and flips >= max(2, floor(big * 0.5)) then
+    elseif (big >= dn * 0.4 and flips >= max(2, floor(big * 0.5)))
+        -- delayed jitter: few big deltas, every one of them reverses the previous, quiet in between
+        or (big >= 3 and flips >= big - 1 and (small_n == 0 or small_sum / small_n < 4)) then
         rec.mode = "jitter"
         rec.center = RES.circular_mean(rec)
         local amp = 0
         for i = 1, rec.n do amp = amp + abs(normalize(rec.yaws[i] - rec.center)) end
         rec.amp = amp / rec.n
-        rec.mode_conf = min(1, (flips / max(1, big - 1)) * 0.5 + rec.jit_alt * 0.5)
+        rec.mode_conf = min(1, (flips / max(1, big - 1)) * 0.5 + max(rec.jit_alt, 0.5) * 0.5)
+        RES.jitter_model(rec)
     elseif mean_abs < C.STATIC_MAX_DELTA then
         rec.mode, rec.mode_conf = "static", 1 - mean_abs / C.STATIC_MAX_DELTA
     elseif mean_abs < C.SWAY_MAX_DELTA then
@@ -935,6 +1289,16 @@ function RES.classify(rec)
     else
         rec.mode, rec.center, rec.mode_conf = "random", RES.circular_mean(rec), 0.5
     end
+
+    -- Hysteresis: a new class has to repeat before it replaces the current one.
+    if rec.mode ~= old_mode and dn >= 6 then
+        if rec.mode_cand == rec.mode then rec.mode_cnt = rec.mode_cnt + 1
+        else rec.mode_cand, rec.mode_cnt = rec.mode, 1 end
+        if rec.mode_cnt < C.MODE_CONFIRM then rec.mode = old_mode end
+    else
+        rec.mode_cand, rec.mode_cnt = nil, 0
+    end
+    if rec.mode ~= "jitter" then rec.jit_pconf = 0 end
 
     if rec.pitch_jit >= 3 then rec.pitch_kind = "FLICK"
     elseif rec.p_avg >= 80 then rec.pitch_kind = "DOWN"
@@ -967,7 +1331,7 @@ local function pair_yaw(hbs, lk, rk)
     local L, R
     for i = 1, #hbs do
         local h = hbs[i]
-        local c = h.center
+        local c = type(h) == "table" and h.center or nil
         if c then
             local k = hb_kind(h)
             if k == lk then
@@ -983,15 +1347,20 @@ local function pair_yaw(hbs, lk, rk)
     return normalize(deg(atan2(dy, dx)) - 90)   -- (L - R) is the body's left vector
 end
 
-function RES.body_hint(rec, pawn, yaw)
+-- Model yaw from hitboxes. Read every BODY_EVERY updates; the delta to the CURRENT eye yaw
+-- is recomputed every update so the cached reference stays valid under jitter.
+function RES.body_hint(rec, pawn, yaw, refresh)
     if not RES.body_ok then return 0 end
-    local hbs = safe(pawn.hitboxes, pawn)
-    if type(hbs) ~= "table" then
-        RES.body_bad = RES.body_bad + 1
-        if RES.body_bad > 40 then RES.body_ok = false end
-        return 0
+    if refresh or rec.body_ref == nil then
+        local hbs = safe(pawn.hitboxes, pawn)
+        if type(hbs) ~= "table" then
+            RES.body_bad = RES.body_bad + 1
+            if RES.body_bad > 40 and RES.body_good == 0 then RES.body_ok = false end
+            return 0
+        end
+        rec.body_ref = pair_yaw(hbs, "ll", "rl") or pair_yaw(hbs, "la", "ra")
     end
-    local ref = pair_yaw(hbs, "ll", "rl") or pair_yaw(hbs, "la", "ra")
+    local ref = rec.body_ref
     if not ref then return 0 end
     local d = normalize(ref - yaw)
     if abs(d) > C.BODY_SANE_DELTA then
@@ -1011,14 +1380,14 @@ end
 -- Which side of the enemy head is covered from our point of view.
 -- Side +1 (CCW) moves the head toward OUR right, so right cover => +1.
 function RES.freestand_hint(lp, pawn, lp_eye, en_eye)
-    local yaw = rad((en_eye - lp_eye):angles().y)
-    local right = vector(sin(yaw), -cos(yaw), 0)
-    local opts = { skip = { lp, pawn }, mask = MASK_VISIBLE }
-    local tl = safe(trace.line, lp_eye, en_eye - right * C.FS_OFFSET, opts)
-    local tr = safe(trace.line, lp_eye, en_eye + right * C.FS_OFFSET, opts)
+    local yaw = rad(U.yaw_to(lp_eye, en_eye))
+    local rx, ry = sin(yaw) * C.FS_OFFSET, -cos(yaw) * C.FS_OFFSET
+    RES.fs_skip[1], RES.fs_skip[2] = lp, pawn
+    local tl = safe(trace.line, lp_eye, vector(en_eye.x - rx, en_eye.y - ry, en_eye.z), RES.fs_opts)
+    local tr = safe(trace.line, lp_eye, vector(en_eye.x + rx, en_eye.y + ry, en_eye.z), RES.fs_opts)
+    RES.fs_skip[1], RES.fs_skip[2] = nil, nil
     if type(tl) ~= "table" or type(tr) ~= "table" then return 0 end
-    local fl, fr = tonumber(tl.fraction) or 1, tonumber(tr.fraction) or 1
-    local bl, br = fl < 0.98, fr < 0.98
+    local bl, br = (tonumber(tl.fraction) or 1) < 0.98, (tonumber(tr.fraction) or 1) < 0.98
     if bl == br then return 0 end
     return br and 1 or -1
 end
@@ -1034,32 +1403,34 @@ end
 
 -- ---------------------------------------------------------------- decision
 function RES.brute_len()
-    return (CFG.brute_pat == PAT_STEP) and STEP_N or BRUTE_N
+    return (CFG.brute_pat == E.PAT_STEP) and #STEP_SEQ or #BRUTE
 end
 
--- multiplier and absolute amount for the current brute index / mode
-function RES.brute_entry(rec)
+-- Multiplier and absolute amount for a brute index (defaults to the record's current index).
+function RES.brute_entry(rec, idx)
     local m = CFG.mode
-    if m == MODE_STATIC or m == MODE_OFFSET then return 1, CFG.desync end
-    if CFG.brute_pat == PAT_STEP then
-        local i = (rec.brute_idx - 1) % STEP_N + 1
+    if m == E.MODE_STATIC or m == E.MODE_OFFSET then return 1, CFG.desync end
+    idx = idx or rec.brute_idx
+    if CFG.brute_pat == E.PAT_STEP then
+        local i = (idx - 1) % #STEP_SEQ + 1
         return STEP_SEQ[i], STEP_SEQ[i] * CFG.brute_step
     end
-    local i = (rec.brute_idx - 1) % BRUTE_N + 1
+    local i = (idx - 1) % #BRUTE + 1
     return BRUTE[i], BRUTE[i] * CFG.desync
 end
 
 function RES.decide_side(rec, b, fs, mv, md)
-    rec.fs_hint, rec.mv_hint, rec.md_hint = fs, mv, md
-    if CFG.mode == MODE_BRUTE or CFG.mode == MODE_OFFSET then
+    rec.b_hint, rec.fs_hint, rec.mv_hint, rec.md_hint = b, fs, mv, md
+    if rec.manual or CFG.mode == E.MODE_BRUTE or CFG.mode == E.MODE_OFFSET then
         rec.score, rec.pred_side = rec.side, rec.side
         return
     end
     local score = rec.side * rec.conf * C.W_LEARNED
-    if CFG.body then score = score + b * C.W_BODY end
-    if CFG.freestand then score = score + fs * C.W_FREESTAND end
-    if CFG.move_mem then score = score + mv * C.W_MOVE end
-    if CFG.move_dir then score = score + md * C.W_MOVEDIR end
+    local hw = RES.hw
+    if CFG.body then score = score + b * C.W_BODY * hw.b end
+    if CFG.freestand then score = score + fs * C.W_FREESTAND * hw.fs end
+    if CFG.move_mem then score = score + mv * C.W_MOVE * hw.mv end
+    if CFG.move_dir then score = score + md * C.W_MOVEDIR * hw.md end
     rec.score = score
     if abs(score) >= C.SIDE_DEADZONE then
         rec.pred_side = (score > 0) and 1 or -1
@@ -1068,11 +1439,11 @@ end
 
 function RES.resolve_pitch(rec, pitch)
     local pm = CFG.pitch
-    if pm == PITCH_OFF then return pitch end
-    if pm == PITCH_CLAMP then return clamp(pitch, -89, 89) end
-    if pm == PITCH_DOWN then return 89 end
-    if pm == PITCH_ZERO then return 0 end
-    if pm == PITCH_UP then return -89 end
+    if pm == E.PITCH_OFF then return pitch end
+    if pm == E.PITCH_CLAMP then return clamp(pitch, -89, 89) end
+    if pm == E.PITCH_DOWN then return 89 end
+    if pm == E.PITCH_ZERO then return 0 end
+    if pm == E.PITCH_UP then return -89 end
     if pitch > 89.5 then return 89 end
     if pitch < -89.5 then return -89 end
     if rec.pitch_jit >= 3 then return 89 end          -- fake-pitch flicker: assume looking down
@@ -1083,7 +1454,7 @@ function RES.compute(rec, yaw, pitch)
     local mode, m = rec.mode, CFG.mode
     local at = rec.at_target
 
-    if m == MODE_OFFSET then
+    if m == E.MODE_OFFSET then
         rec.amount = CFG.yaw_off
         rec.resolved_yaw = normalize(at + CFG.yaw_off)
         rec.resolved_pitch = RES.resolve_pitch(rec, pitch)
@@ -1091,10 +1462,33 @@ function RES.compute(rec, yaw, pitch)
         return
     end
 
+    rec.jit_k = nil
+    if mode == "jitter" and (m == E.MODE_ADAPTIVE or m == E.MODE_JITSPIN) then
+        local jm = CFG.jit_mode
+        if jm == E.JIT_FOLLOW then
+            rec.amount, rec.resolved_yaw = 0, yaw
+            rec.resolved_pitch = RES.resolve_pitch(rec, pitch)
+            rec.resolved = true
+            return
+        end
+        if rec.jit_pconf >= C.JIT_PRED_CONF and rec.jit_half > 0 then
+            local seq = JIT_SEQ[(jm == E.JIT_PREDICT) and 2 or 1]
+            local k = seq[(rec.brute_idx - 1) % #seq + 1]
+            -- the newest side has lasted a full period: the next update is on the other side
+            local nxt = (rec.jit_run >= rec.jit_period) and -rec.jit_side or rec.jit_side
+            local off = nxt * rec.jit_half * k
+            rec.jit_k, rec.amount = k, off
+            rec.resolved_yaw = normalize(rec.center + off)
+            rec.resolved_pitch = RES.resolve_pitch(rec, pitch)
+            rec.resolved = true
+            return
+        end
+    end
+
     local base
-    if CFG.base == BASE_TARGET then
+    if CFG.base == E.BASE_TARGET then
         base = at
-    elseif CFG.base == BASE_EYE then
+    elseif CFG.base == E.BASE_EYE then
         base = yaw
     elseif mode == "spin" then
         base = at
@@ -1105,7 +1499,7 @@ function RES.compute(rec, yaw, pitch)
     else
         base = yaw
     end
-    if m == MODE_JITSPIN then
+    if m == E.MODE_JITSPIN then
         if mode == "spin" then
             base = normalize(yaw + rec.spin_rate * C.SPIN_LEAD)
         elseif mode == "jitter" then
@@ -1118,7 +1512,7 @@ function RES.compute(rec, yaw, pitch)
         amount = amount * CFG.jit_sc_f
     elseif mode == "random" then
         amount = amount * 0.75
-    elseif mode == "spin" and m == MODE_JITSPIN then
+    elseif mode == "spin" and m == E.MODE_JITSPIN then
         amount = amount * 0.5
     end
     if rec.moving then amount = amount * CFG.move_sc_f end
@@ -1133,18 +1527,25 @@ function RES.compute(rec, yaw, pitch)
 end
 
 -- Little trust in the current guess: the ragebot assist prefers the body and adjusts hitchance.
+-- Returns false or a reason tag ("LC" / "RES").
 function RES.unresolved(rec)
     if not rec or not rec.resolved then return false end
-    if rec.miss_streak >= 2 or rec.brute_idx >= 3 then return true end
-    if rec.mode == "random" then return rec.conf < 0.5 end
-    if rec.mode == "jitter" and rec.amp > 35 then return rec.conf < 0.5 end
+    if rec.lc then return "LC" end
+    if rec.manual then return false end
+    if rec.miss_streak >= 2 or rec.brute_idx >= 3 then return "RES" end
+    if rec.mode == "random" and rec.conf < 0.5 then return "RES" end
+    if rec.mode == "jitter" and rec.amp > 35 and rec.conf < 0.5 then return "RES" end
     return false
 end
 
 -- ---------------------------------------------------------------- memory write
+function RES.can_write()
+    return CFG.apply and RES.insecure and RES.write_ok ~= false
+end
+
 function RES.apply(pawn, rec)
     rec.applied = false
-    if not CFG.apply or not RES.insecure or RES.write_ok == false then return end
+    if not RES.can_write() then return end
     local ang = vector(rec.resolved_pitch, rec.resolved_yaw, 0)
 
     if RES.write_cls then
@@ -1168,7 +1569,7 @@ function RES.apply(pawn, rec)
         end
     end
     RES.write_ok = false
-    notify("m_angEyeAngles not found in schema; tracking only")
+    notify("m_angEyeAngles not writable (schema / insecure); tracking only")
 end
 
 function RES.read_simtime(pawn)
@@ -1180,8 +1581,10 @@ function RES.read_simtime(pawn)
 end
 
 -- ---------------------------------------------------------------- per-player update
-function RES.process(pawn, ctrl, lp, lp_alive, lp_eye, now, tick, rt)
-    local rec = RES.get_record(ctrl, pawn)
+function RES.process(pawn, ctrl, addr, lp, lp_alive, lp_eye, now, tick, rt)
+    local rec = RES.get_record(ctrl, pawn, addr)
+    if not rec then return nil end
+    local gap = rt - rec.seen_rt                 -- > 0.25 s: dormant / respawned in between
     rec.seen_rt = rt
 
     local eye = pawn:eye_angles()
@@ -1191,6 +1594,9 @@ function RES.process(pawn, ctrl, lp, lp_alive, lp_eye, now, tick, rt)
     local simt = RES.read_simtime(pawn)
     local fresh
     if simt then
+        if CFG.lc_detect and rec.sim_time and gap < 0.25 and simt < rec.sim_time - 1e-4 then
+            rec.lc_t = now                       -- simulation time went backwards: tickbase shift
+        end
         fresh = (simt ~= rec.sim_time)
         rec.sim_time = simt
     else
@@ -1209,6 +1615,25 @@ function RES.process(pawn, ctrl, lp, lp_alive, lp_eye, now, tick, rt)
         if rec.resolved then RES.apply(pawn, rec) end
         return rec
     end
+    if gap > 0.25 then
+        rec.n, rec.dn, rec.head, rec.dhead = 0, 0, 0, 0       -- stale history must not mix in
+        rec.last_origin, rec.body_ref, rec.fs_cache = nil, nil, nil
+        rec.pitch_jit, rec.jit_pconf, rec.mode_cand, rec.mode_cnt = 0, 0, nil, 0
+    end
+    rec.upd = rec.upd + 1
+
+    local origin = pawn:origin()
+    if CFG.lc_detect and origin and rec.last_origin then
+        local dx, dy, dz = origin.x - rec.last_origin.x, origin.y - rec.last_origin.y, origin.z - rec.last_origin.z
+        if dx * dx + dy * dy + dz * dz > C.LC_DIST_SQR then rec.lc_t = now end
+    end
+    rec.last_origin = origin
+    rec.lc = CFG.lc_detect and (now - rec.lc_t) < C.LC_HOLD and (now - rec.lc_t) >= 0
+    -- Angles received right after an LC break are not his anti-aim: keep the last stable result.
+    if rec.lc and CFG.lc_hold and rec.resolved and (now - rec.lc_t) < C.LC_FREEZE then
+        RES.apply(pawn, rec)
+        return rec
+    end
 
     local vel = pawn:velocity()
     local speed = vel:length2d()
@@ -1218,7 +1643,7 @@ function RES.process(pawn, ctrl, lp, lp_alive, lp_eye, now, tick, rt)
 
     if speed > C.MOVE_SPEED then
         rec.moving = true
-        rec.last_move_yaw = normalize(vel:angles().y)
+        rec.last_move_yaw = normalize(deg(atan2(vel.y, vel.x)))
         rec.last_move_t = now
     else
         rec.moving = false
@@ -1226,10 +1651,16 @@ function RES.process(pawn, ctrl, lp, lp_alive, lp_eye, now, tick, rt)
 
     local en_eye = pawn:eye_position()
     rec.en_eye = en_eye
-    rec.at_target = normalize(calc_angle(en_eye, lp_eye).y)
+    rec.at_target = normalize(U.yaw_to(en_eye, lp_eye))
 
-    local b  = CFG.body and RES.body_hint(rec, pawn, yaw) or 0
-    local fs = (CFG.freestand and lp_alive) and RES.freestand_hint(lp, pawn, lp_eye, en_eye) or 0
+    local b = CFG.body and RES.body_hint(rec, pawn, yaw, rec.upd % C.BODY_EVERY == 0) or 0
+    local fs = 0
+    if CFG.freestand and lp_alive then
+        if rec.fs_cache == nil or rec.upd % C.FS_EVERY == 1 then
+            rec.fs_cache = RES.freestand_hint(lp, pawn, lp_eye, en_eye)
+        end
+        fs = rec.fs_cache or 0
+    end
     local mv = CFG.move_mem and RES.movement_hint(rec, yaw, now) or 0
     local md = 0
     if CFG.move_dir and speed > C.MOVEDIR_SPEED and rec.last_move_yaw then
@@ -1243,25 +1674,153 @@ function RES.process(pawn, ctrl, lp, lp_alive, lp_eye, now, tick, rt)
 end
 
 -- ---------------------------------------------------------------- shot feedback
-function RES.on_hit(rec, hitgroup, dmg)
-    local pending, shot = RES.pending, nil
-    for i = #pending, 1, -1 do
-        if pending[i].key == rec.key then
-            shot = shot or pending[i]
-            tremove(pending, i)
+function RES.log(kind, text)
+    VIS.push(kind, text)
+    if CFG.log_hits then say(text) end
+end
+
+-- Spread cone sample, refreshed every createmove. At weapon_fire the smaller of the last two
+-- samples is used: at least one of them predates the shot's own accuracy penalty.
+function RES.sample_spread(lp)
+    if not (CFG.enable and CFG.feedback and CFG.spread_blame) then
+        STATE.inacc, STATE.inacc_prev = nil, nil
+        return
+    end
+    local info = safe(lp.weapon_info, lp)
+    local v = nil
+    if type(info) == "table" then
+        local ia, sp = tonumber(info.inaccuracy), tonumber(info.spread)
+        if ia and sp and ia >= 0 and sp >= 0 and ia + sp < 1 then v = ia + sp end
+    end
+    STATE.inacc_prev, STATE.inacc = STATE.inacc, v
+end
+
+function RES.is_local_controller(ctrl)
+    if not ctrl then return false end
+    local lc = entity.local_controller()
+    if not lc then return false end
+    return safe(ctrl.address, ctrl) == lc:address()
+end
+
+-- Target of our shot. Returns record, on_target (the shot ray really crossed his model).
+function RES.find_shot_target(lp)
+    local from = safe(lp.eye_position, lp)
+    if not from then return nil, false end
+    local a1, a2 = STATE.cmd_angles, safe(engine.view_angles)    -- sent angles first (silent aim)
+    for i = 1, 2 do
+        local a = (i == 1) and a1 or a2
+        if a then
+            local r = safe(trace.bullet, from, from + a:forward() * 8192)
+            if type(r) == "table" and r.hit and r.entity then
+                local rec = RES.record_by_pawn(r.entity)
+                if rec then return rec, true end
+            end
         end
     end
-    rec.hits, rec.hit_streak, rec.miss_streak = rec.hits + 1, rec.hit_streak + 1, 0
-    rec.last_hit_t = globals.curtime()
-    RES.total_hits = RES.total_hits + 1
+    -- ragebot assist target (closest to the crosshair, already filtered)
+    if RB.t_addr then
+        local rec = RES.by_pawn[RB.t_addr]
+        if rec then return rec, false end
+    end
+    -- fallback: closest tracked enemy within 12 degrees
+    local va = a1 or a2
+    if not va then return nil, false end
+    local best, best_fov = nil, 12
+    local rt = globals.realtime()
+    for _, rec in pairs(RES.records) do
+        if rec.en_eye and rt - rec.seen_rt < 0.2 then
+            local fov = U.fov(from, rec.en_eye, va)
+            if fov < best_fov then best, best_fov = rec, fov end
+        end
+    end
+    return best, false
+end
 
-    local head = (hitgroup == 1)
+function RES.on_weapon_fire(ev)
+    if not CFG.enable then return end
+    local ctrl = safe(ev.get_controller, ev, "userid")
+    if not ctrl then return end
+    if not RES.is_local_controller(ctrl) then
+        local rec = RES.record_by_pawn(safe(ev.get_pawn, ev, "userid")) or RES.record_by_controller(ctrl)
+        if rec then rec.reveal_t = globals.curtime() end
+        return
+    end
+    if not CFG.feedback then return end
+    if WPN.non_gun_name(safe(ev.get_string, ev, "weapon")) then return end
+    local lp = entity.local_pawn()
+    if not lp then return end
+    local info = safe(lp.weapon_info, lp)
+    if type(info) == "table" and info.gun == false then return end
+
+    local rec, on_target = RES.find_shot_target(lp)
+    if not rec then return end
+    local now = globals.curtime()
+    rec.shots = rec.shots + 1
+    RES.stats.shots = RES.stats.shots + 1
+    if now - rec.last_shot_t < C.SHOT_DEDUPE then return end   -- spray: one pending shot per slice
+    rec.last_shot_t = now
+
+    local cone = nil
+    local a, b = STATE.inacc, STATE.inacc_prev
+    local s = (a and b) and min(a, b) or a or b
+    if s and rec.en_eye then
+        local from = safe(lp.eye_position, lp)
+        if from then cone = s * from:dist(rec.en_eye) end
+    end
+    local pending = RES.pending
+    pending[#pending + 1] = {
+        key = rec.key, t = now, side = rec.pred_side, idx = rec.brute_idx, mode = rec.mode,
+        moving = rec.moving, lp_air = STATE.lp_air, baim = RB.baim ~= nil, lc = rec.lc,
+        cone = cone, on_target = on_target, jit = rec.jit_k ~= nil,
+        h = { b = sign(rec.b_hint), fs = sign(rec.fs_hint), mv = sign(rec.mv_hint), md = sign(rec.md_hint) },
+    }
+    if #pending > C.PENDING_MAX then tremove(pending, 1) end
+end
+
+-- Oldest pending shot of this target. If there is none, the most recent uncertain shot
+-- (attributed without a ray hit) is dropped: it went to this player, not to the guessed one.
+function RES.take_pending(key)
+    local pending = RES.pending
+    for i = 1, #pending do
+        if pending[i].key == key then return tremove(pending, i) end
+    end
+    for i = #pending, 1, -1 do
+        if not pending[i].on_target then
+            tremove(pending, i)
+            break
+        end
+    end
+    return nil
+end
+
+-- Hints that agreed with the confirmed side gain weight, the others lose it.
+function RES.learn_hints(shot, truth)
+    if not CFG.hint_learn or not shot or not shot.h or truth == 0 then return end
+    local hw = RES.hw
+    for k, v in pairs(shot.h) do
+        if v ~= 0 then
+            if v == truth then hw[k] = min(C.HW_MAX, hw[k] + C.HW_GAIN)
+            else hw[k] = max(C.HW_MIN, hw[k] - C.HW_LOSS) end
+        end
+    end
+end
+
+function RES.on_hit(rec, hitgroup, dmg)
+    local shot = RES.take_pending(rec.key)
+    rec.hits, rec.hit_streak, rec.miss_streak = rec.hits + 1, rec.hit_streak + 1, 0
+    local st = RES.stats
+    st.hits = st.hits + 1
+
+    local head = (hitgroup == K.HG_HEAD)
+    if head then st.heads = st.heads + 1 end
     local partial = CFG.body_partial and not head and not (shot and shot.baim)
     local used_side = shot and shot.side or rec.pred_side
-    local m = RES.brute_entry(rec)
-    if not partial and m ~= 0 then
+    local m = RES.brute_entry(rec, shot and shot.idx or nil)   -- multiplier that was live at fire time
+    local jit = shot and shot.jit                              -- jitter model shot: the index that hit stays
+    if not partial and m ~= 0 and not jit then
         rec.side = sign(used_side * m)
-        if CFG.brute_pat ~= PAT_STEP and abs(m) == 1 then rec.brute_idx = 1 end
+        if CFG.brute_pat ~= E.PAT_STEP and abs(m) == 1 then rec.brute_idx = 1 end
+        RES.learn_hints(shot, rec.side)
     end
 
     -- anti-anti-bruteforce: a second hit in a row that only landed on the other side means he
@@ -1283,25 +1842,41 @@ function RES.on_hit(rec, hitgroup, dmg)
         rec.preflipped = true
         pre = "  · pre-flip"
     end
+    rec.last_reason = nil
     RES.remember(rec)
-    VIS.push(head and "hit" or "body", format("%s  %s %d%s%s", rec.name, head and "HEAD" or "BODY",
+    RES.log(head and "hit" or "body", format("%s  %s %d%s%s", rec.name, head and "HEAD" or "BODY",
         floor(tonumber(dmg) or 0), partial and " (partial)" or "", pre))
 end
 
+function RES.miss_reason(shot, rec)
+    if STATE.lp_dead then return "death" end                  -- we died before the shot could register
+    if STATE.rt - rec.seen_rt > 0.25 then return "lost" end   -- target went dormant / left
+    if shot.lc then return "lagcomp" end
+    if shot.lp_air then return "airborne" end
+    if shot.moving then return "moving" end
+    if CFG.spread_blame and shot.cone and shot.cone > C.SPREAD_BLAME then return "spread" end
+    return "resolver"
+end
+
 function RES.on_miss(shot, rec)
-    rec.misses, rec.hit_streak = rec.misses + 1, 0
-    rec.last_miss_t = globals.curtime()
-    RES.total_misses = RES.total_misses + 1
+    local st = RES.stats
+    local reason = RES.miss_reason(shot, rec)
+    rec.misses, rec.hit_streak, rec.last_reason = rec.misses + 1, 0, reason
+    st.misses = st.misses + 1
+    st[reason] = (st[reason] or 0) + 1
+
+    if reason ~= "resolver" then
+        -- not the resolver's fault: no brute step, no anti-bruteforce bookkeeping
+        rec.conf = max(0, rec.conf - C.SOFT_CONF_LOSS)
+        RES.remember(rec)
+        RES.log("miss", format("%s  MISS (%s)", rec.name, reason))
+        return
+    end
+
     rec.conf = max(0, rec.conf - C.MISS_CONF_LOSS)
     local prev = rec.prev_result
     rec.prev_result = "miss"
-
-    if shot.moving or shot.lp_air then
-        -- moving targets / airborne shooter miss for many reasons; do not step the brute table
-        RES.remember(rec)
-        VIS.push("miss", format("%s  MISS (%s)", rec.name, shot.moving and "moving" or "airborne"))
-        return
-    end
+    rec.manual = false
     if prev == "hit" and CFG.anti_ab then
         if rec.preflipped then
             rec.ab_score = max(0, rec.ab_score - 1)   -- the pre-flip was wrong
@@ -1311,26 +1886,31 @@ function RES.on_miss(shot, rec)
         end
     end
     rec.miss_streak = rec.miss_streak + 1
+    if not shot.jit then
+        local bm = RES.brute_entry(rec, shot.idx)
+        if abs(bm) == 1 then RES.learn_hints(shot, -sign(shot.side * bm)) end   -- the other side was right
+    end
     local info = ""
     if rec.miss_streak >= CFG.miss_tol then
         rec.miss_streak = 0
-        if CFG.mode == MODE_STATIC or CFG.mode == MODE_OFFSET then
+        if CFG.mode == E.MODE_STATIC or CFG.mode == E.MODE_OFFSET then
             rec.side = -rec.side
             info = "  -> flip"
-        else
+        elseif shot.idx == rec.brute_idx then            -- step once per brute index, not per queued shot
             rec.brute_idx = rec.brute_idx % RES.brute_len() + 1
             info = format("  -> brute %d", rec.brute_idx)
         end
     end
     RES.remember(rec)
-    VIS.push("miss", format("%s  MISS%s", rec.name, info))
+    RES.log("miss", format("%s  MISS (resolver)%s", rec.name, info))
 end
 
 function RES.check_pending(now)
     local pending = RES.pending
+    local win = CFG.miss_win_s or 0.35
     for i = #pending, 1, -1 do
         local s = pending[i]
-        if now - s.t > CFG.miss_win_s then
+        if now - s.t > win then
             tremove(pending, i)
             local rec = RES.records[s.key]
             if rec then RES.on_miss(s, rec) end
@@ -1340,100 +1920,24 @@ function RES.check_pending(now)
     end
 end
 
-function RES.find_shot_target(lp)
-    local from = lp:eye_position()
-    local angs = { safe(engine.view_angles), STATE.cmd_angles }
-    for i = 1, 2 do
-        local a = angs[i]
-        if a then
-            local r = safe(trace.bullet, from, from + a:forward() * 8192)
-            if type(r) == "table" and r.hit and r.entity then
-                local rec = RES.record_by_pawn(r.entity)
-                if rec then return rec end
-            end
-        end
-    end
-    -- ragebot assist target (closest to the crosshair, already filtered)
-    if RB.t_addr then
-        local rec = RES.by_pawn[RB.t_addr]
-        if rec then return rec end
-    end
-    -- fallback: closest tracked enemy within 12 degrees
-    local va = angs[1]
-    if not va then return nil end
-    local best, best_fov = nil, 12
-    local rt = globals.realtime()
-    for _, rec in pairs(RES.records) do
-        if rec.pawn and rt - rec.seen_rt < 0.2 then
-            local ep = safe(rec.pawn.eye_position, rec.pawn)
-            if ep then
-                local want = calc_angle(from, ep)
-                local dy = abs(normalize(want.y - va.y))
-                local dp = abs(want.x - va.x)
-                local fov = sqrt(dy * dy + dp * dp)
-                if fov < best_fov then best, best_fov = rec, fov end
-            end
-        end
-    end
-    return best
-end
-
-function RES.is_local_controller(ctrl)
-    if not ctrl then return false end
-    local lc = entity.local_controller()
-    if not lc then return false end
-    return ctrl:address() == lc:address()
-end
-
-function RES.on_weapon_fire(ev)
-    if not CFG.enable then return end
-    local ctrl = safe(ev.get_controller, ev, "userid")
-    if not ctrl then return end
-    if not RES.is_local_controller(ctrl) then
-        local rec = RES.record_by_pawn(safe(ev.get_pawn, ev, "userid")) or RES.record_by_pawn(safe(ctrl.pawn, ctrl))
-        if rec then rec.reveal_t = globals.curtime() end
-        return
-    end
-    if not CFG.feedback then return end
-    local lp = entity.local_pawn()
-    if not lp then return end
-    local info = safe(lp.weapon_info, lp)
-    if type(info) == "table" and info.gun == false then return end
-
-    local rec = RES.find_shot_target(lp)
-    if not rec then return end
-    local now = globals.curtime()
-    rec.shots = rec.shots + 1
-    RES.total_shots = RES.total_shots + 1
-    if now - rec.last_shot_t < C.SHOT_DEDUPE then return end   -- spray: one pending shot per slice
-    rec.last_shot_t = now
-    local pending = RES.pending
-    pending[#pending + 1] = {
-        key = rec.key, t = now, side = rec.pred_side, idx = rec.brute_idx, mode = rec.mode,
-        moving = rec.moving, lp_air = STATE.lp_air, baim = RB.baim ~= nil,
-    }
-    if #pending > C.PENDING_MAX then tremove(pending, 1) end
-end
-
 function RES.on_player_hurt(ev)
     if not CFG.enable or not CFG.feedback then return end
-    local att = safe(ev.get_controller, ev, "attacker")
-    local vic = safe(ev.get_controller, ev, "userid")
     local lc = entity.local_controller()
     if not lc then return end
     local la = lc:address()
+    local att = safe(ev.get_controller, ev, "attacker")
+    local vic = safe(ev.get_controller, ev, "userid")
+    local att_a = att and safe(att.address, att) or nil
+    local vic_a = vic and safe(vic.address, vic) or nil
+    local bullet = not WPN.non_gun_name(safe(ev.get_string, ev, "weapon"))   -- grenades / fire / knife do not teach
 
-    if att and att:address() == la then
-        local rec = RES.record_by_pawn(safe(ev.get_pawn, ev, "userid"))
-        if not rec and vic then
-            local sid = safe(vic.steam_id, vic)
-            if sid then rec = RES.records[sid] end
-            if not rec then rec = RES.record_by_pawn(safe(vic.pawn, vic)) end
-        end
+    if att_a == la then
+        if not bullet or vic_a == la then return end
+        local rec = RES.record_by_pawn(safe(ev.get_pawn, ev, "userid")) or RES.record_by_controller(vic)
         if not rec then return end
         RES.on_hit(rec, safe(ev.get_int, ev, "hitgroup") or 0, safe(ev.get_int, ev, "dmg_health") or 0)
-    elseif CFG.flip_on_hurt and att and vic and vic:address() == la then
-        local rec = RES.record_by_pawn(safe(ev.get_pawn, ev, "attacker")) or RES.record_by_pawn(safe(att.pawn, att))
+    elseif CFG.flip_on_hurt and bullet and att and vic_a == la then
+        local rec = RES.record_by_pawn(safe(ev.get_pawn, ev, "attacker")) or RES.record_by_controller(att)
         if rec then
             rec.side = -rec.side
             RES.remember(rec)
@@ -1445,36 +1949,52 @@ function RES.reset_history(rec)
     rec.n, rec.dn, rec.head, rec.dhead = 0, 0, 0, 0
     rec.pitch_jit, rec.pitch_kind = 0, ""
     rec.mode, rec.mode_conf = "static", 0
-    rec.resolved, rec.applied = false, false
-    rec.sim_time, rec.last_move_yaw = nil, nil
+    rec.jit_pconf, rec.jit_k, rec.mode_cand, rec.mode_cnt = 0, nil, nil, 0
+    rec.resolved, rec.applied, rec.manual = false, false, false
+    rec.sim_time, rec.last_move_yaw, rec.last_origin = nil, nil, nil
+    rec.body_ref, rec.fs_cache, rec.lc, rec.lc_t = nil, nil, false, -1e9
     rec.miss_streak = 0
 end
 
 function RES.on_player_death(ev)
     if not CFG.enable then return end
     local rec = RES.record_by_pawn(safe(ev.get_pawn, ev, "userid"))
-    if not rec then
-        local vic = safe(ev.get_controller, ev, "userid")
-        if vic then
-            local sid = safe(vic.steam_id, vic)
-            if sid then rec = RES.records[sid] end
-        end
-    end
+        or RES.record_by_controller(safe(ev.get_controller, ev, "userid"))
     if not rec then return end
     local pending = RES.pending
     for i = #pending, 1, -1 do
         if pending[i].key == rec.key then tremove(pending, i) end
     end
     RES.reset_history(rec)
+    if RES.focus == rec then RES.focus = nil end
     local att = safe(ev.get_controller, ev, "attacker")
     if att and RES.is_local_controller(att) then
         rec.kills = rec.kills + 1
-        VIS.push("kill", format("%s  KILL  (%d/%d)", rec.name, rec.hits, rec.misses))
+        RES.log("kill", format("%s  KILL  (%d/%d)", rec.name, rec.hits, rec.misses))
     end
 end
 
+-- Manual override: rising edge of the flip bind inverts the crosshair target's side.
+function RES.check_flip()
+    local on = bind_on(UI.k_flip)
+    if on == STATE.flip_prev then return end
+    STATE.flip_prev = on
+    if not on then return end
+    local rec = RES.focus
+    if not rec then return end
+    rec.side = -rec.pred_side
+    rec.pred_side = rec.side
+    rec.conf = max(rec.conf, 0.6)
+    rec.manual, rec.brute_idx, rec.miss_streak = true, 1, 0
+    RES.remember(rec)
+    RES.log("info", format("%s  manual flip -> %s", rec.name, rec.side > 0 and "L" or "R"))
+end
+
 -- ---------------------------------------------------------------- frame stage
+-- After lag compensation the game may restore the networked angles: write them again.
+-- Fresh pawns are fetched every time (never a cached pointer); skipped entirely if no write is possible.
 function RES.reapply_all()
+    if not RES.can_write() then return end
     local players = safe(entity.players)
     if type(players) ~= "table" then return end
     for i = 1, #players do
@@ -1492,26 +2012,25 @@ function RES.purge(rt)
     for key, rec in pairs(RES.records) do
         if rt - rec.seen_rt > C.PURGE_AFTER then
             if rec.pawn_addr and RES.by_pawn[rec.pawn_addr] == rec then RES.by_pawn[rec.pawn_addr] = nil end
+            if RES.focus == rec then RES.focus = nil end
             RES.records[key] = nil
         end
     end
 end
 
 function RES.frame(st)
-    if st ~= STAGE_NET_END and st ~= STAGE_LAGCOMP then return end
-    STATE.rt = globals.realtime()
+    if st ~= E.STAGE_NET_END and st ~= E.STAGE_LAGCOMP then return end
     cfg_tick(false)
     if not CFG.enable or not engine.in_game() then
         RES.focus = nil
         return
     end
-    RES.insecure = safe(client.insecure) == true
-    STATE.insecure = RES.insecure
-
-    if st == STAGE_LAGCOMP then
+    if st == E.STAGE_LAGCOMP then
         RES.reapply_all()
         return
     end
+    RES.insecure = safe(client.insecure) == true
+    STATE.insecure = RES.insecure
 
     local lp = entity.local_pawn()
     if not lp then return end
@@ -1521,25 +2040,24 @@ function RES.frame(st)
 
     local now, tick, rt = globals.curtime(), globals.tickcount(), STATE.rt
     local va = safe(engine.view_angles)
-    local players = entity.players()
+    local players = safe(entity.players)
+    if type(players) ~= "table" then return end
     local focus, focus_fov = nil, C.FOCUS_FOV
     for i = 1, #players do
         local p = players[i]
         local pawn = p.pawn
         if pawn and pawn:alive() and pawn:is_enemy() then
-            local ok, rec = pcall(RES.process, pawn, p.controller, lp, lp_alive, lp_eye, now, tick, rt)
+            local ok, rec = pcall(RES.process, pawn, p.controller, pawn:address(), lp, lp_alive, lp_eye, now, tick, rt)
             if not ok then
-                if CFG.debug then say("process error: " .. tostring(rec)) end
+                if CFG.debug then report("process", rec) end
             elseif rec and va and rec.en_eye then
-                local want = calc_angle(lp_eye, rec.en_eye)
-                local dy = abs(normalize(want.y - va.y))
-                local dp = abs(want.x - va.x)
-                local fov = sqrt(dy * dy + dp * dp)
+                local fov = U.fov(lp_eye, rec.en_eye, va)
                 if fov < focus_fov then focus, focus_fov = rec, fov end
             end
         end
     end
     RES.focus = focus
+    RES.check_flip()
 
     if CFG.feedback then RES.check_pending(now) end
     RES.purge(rt)
@@ -1556,15 +2074,16 @@ end
 
 function ACT.reset_learn()
     RES.records, RES.by_pawn, RES.pending, RES.store = {}, {}, {}, {}
-    RES.total_hits, RES.total_misses, RES.total_shots = 0, 0, 0
-    RES.focus = nil
+    for k in pairs(RES.stats) do RES.stats[k] = 0 end
+    for k in pairs(RES.hw) do RES.hw[k] = 1 end
+    RES.focus, RES.store_dirty = nil, false
     safe(db.save, META.db, {})
     notify("Learned data cleared")
 end
 
 function RES.on_round_start()
     RES.reset_volatile()
-    RES.store_save()
+    RES.store_save(false)
 end
 
 function RES.on_level_init()
@@ -1577,21 +2096,21 @@ function RES.on_level_init()
 end
 
 function RES.on_level_shutdown()
-    RES.store_save()
+    RES.store_save(false)
     RES.records, RES.by_pawn, RES.pending = {}, {}, {}
     RES.focus = nil
 end
 
 -- ============================================================================
---  RAGEBOT ASSIST (ported from s1 v3.2)
+--  RAGEBOT ASSIST
 --  There is no ragebot module in the API, so values are read and written through
 --  config.get / config.set. Paths are discovered from config.keys; originals are
 --  journaled in db and returned when the assist stands down.
 -- ============================================================================
-RB.tick_n, RB.cm_t, RB.paint_t, RB.hk_t = 0, -1e9, -1e9, -1e9
-RB.air_ticks, RB.land_soon, RB.sim_fail, RB.g_tick, RB.sync_mode = 0, false, 0, K.GRAVITY * 0.015625, false
+RB.tick_n, RB.cm_t, RB.paint_t, RB.hk_t, RB.store_t = 0, -1e9, -1e9, -1e9, 0
+RB.air_ticks, RB.land_soon, RB.sim_fail, RB.sim_disabled, RB.g_tick = 0, false, 0, false, K.GRAVITY * 0.015625
 RB.state, RB.wgroup, RB.waddr, RB.wtick, RB.eval_at = nil, nil, nil, -1e9, 0
-RB.t_hp, RB.t_air, RB.t_move, RB.t_addr, RB.t_unres, RB.t_name = nil, false, false, nil, false, nil
+RB.t_hp, RB.t_air, RB.t_move, RB.t_addr, RB.t_unres = nil, false, false, nil, false
 RB.baim_reason, RB.baim_until, RB.base_hc, RB.base_dmg = nil, 0, nil, nil
 RB.hc, RB.dmg, RB.safe, RB.baim, RB.strict, RB.pub_thp = nil, nil, false, nil, false, nil
 RB.touched, RB.paused, RB.in_game = false, false, true
@@ -1671,9 +2190,9 @@ Journal.data, Journal.disk = {}, {}
 Journal.add_dirty, Journal.rm_dirty, Journal.rm_t = false, false, 0
 
 function Journal.add(path, orig)
-    local v = copy(orig)
+    local v = U.copy(orig)
     Journal.data[path] = v
-    if not same(Journal.disk[path], v) then Journal.add_dirty = true end
+    if not U.same(Journal.disk[path], v) then Journal.add_dirty = true end
 end
 
 function Journal.remove(path)
@@ -1682,14 +2201,14 @@ function Journal.remove(path)
     if Journal.disk[path] ~= nil then Journal.rm_dirty, Journal.rm_t = true, STATE.rt end
 end
 
-local function journal_missing()
+function Journal.missing()
     for k, v in pairs(Journal.data) do
-        if not same(Journal.disk[k], v) then return true end
+        if not U.same(Journal.disk[k], v) then return true end
     end
     return false
 end
 
-local function journal_stale()
+function Journal.stale()
     for k in pairs(Journal.disk) do
         if Journal.data[k] == nil then return true end
     end
@@ -1699,11 +2218,11 @@ end
 function Journal.flush(force)
     local need = false
     if Journal.add_dirty then
-        need = journal_missing()
+        need = Journal.missing()
         if not need then Journal.add_dirty = false end
     end
     if not need and Journal.rm_dirty and (force or STATE.rt - Journal.rm_t >= K.JOURNAL_LAZY) then
-        need = journal_stale()
+        need = Journal.stale()
         if not need then Journal.rm_dirty = false end
     end
     if not need then return end
@@ -1711,7 +2230,7 @@ function Journal.flush(force)
     local ok, res = pcall(db.save, META.db_journal, Journal.data)
     if ok and res ~= false then
         local disk = {}
-        for k, v in pairs(Journal.data) do disk[k] = copy(v) end
+        for k, v in pairs(Journal.data) do disk[k] = U.copy(v) end
         Journal.disk = disk
         Journal.add_dirty, Journal.rm_dirty = false, false
     else
@@ -1728,13 +2247,13 @@ function Journal.restore()
     for path, val in pairs(saved) do
         if type(path) == "string" and val ~= nil and val ~= json.null then
             any = true
-            Journal.disk[path] = copy(val)
+            Journal.disk[path] = U.copy(val)
             local cur = cfg_get(path)
-            if cur ~= nil and type(cur) == type(val) and not same(cur, val) then
+            if cur ~= nil and type(cur) == type(val) and not U.same(cur, val) then
                 if cfg_set(path, val) then
                     n = n + 1
                 else
-                    Journal.data[path] = copy(val)
+                    Journal.data[path] = U.copy(val)
                 end
             end
         end
@@ -1756,24 +2275,24 @@ local GENERIC_EXCLUDE = {
 local ORDER_P = { "hc", "dmg", "safe", "baim", "hitbox" }
 local SL = {
     hc = { tag = "HC", title = "Hitchance",
-           patterns = { "hit[%s_%.%-]?chance" }, exclude = {},
-           ok = function(v) return type(v) == "number" and v >= 0 and v <= 100 end },
+        patterns = { "hit[%s_%.%-]?chance" }, exclude = {},
+        ok = function(v) return type(v) == "number" and v >= 0 and v <= 100 end },
     dmg = { tag = "DMG", title = "Min damage",
-            patterns = { "min[%s_%.%-]?dam", "min[%s_%.%-]?dmg" }, exclude = {},
-            ok = function(v) return type(v) == "number" and v >= 0 and v <= 300 end },
+        patterns = { "min[%s_%.%-]?dam", "min[%s_%.%-]?dmg" }, exclude = {},
+        ok = function(v) return type(v) == "number" and v >= 0 and v <= 300 end },
     safe = { tag = "SAFE", title = "Safepoint",
-             patterns = { "safe[%s_%.%-]?point" },
-             exclude = { "unsafe", "multi", "hitbox", "limit", "min" },
-             ok = function(v) return type(v) == "boolean" or (type(v) == "number" and v >= 0 and v <= 10) end },
+        patterns = { "safe[%s_%.%-]?point" },
+        exclude = { "unsafe", "multi", "hitbox", "limit", "min" },
+        ok = function(v) return type(v) == "boolean" or (type(v) == "number" and v >= 0 and v <= 10) end },
     baim = { tag = "BAIM", title = "Body-aim",
-             patterns = { "body[%s_%.%-]?aim", "baim", "prefer[%s_%.%-]?body", "force[%s_%.%-]?body" },
-             exclude = { "lethal", "disabl", "hp", "health", "dam", "dmg", "condition", "unsafe",
-                         "after", "miss", "shot", "min", "max" },
-             ok = function(v) return type(v) == "boolean" end },
+        patterns = { "body[%s_%.%-]?aim", "baim", "prefer[%s_%.%-]?body", "force[%s_%.%-]?body" },
+        exclude = { "lethal", "disabl", "hp", "health", "dam", "dmg", "condition", "unsafe",
+                    "after", "miss", "shot", "min", "max" },
+        ok = function(v) return type(v) == "boolean" end },
     hitbox = { tag = "HITBOX", title = "Hitboxes",
-               patterns = { "hit[%s_%.%-]?box" },
-               exclude = { "point", "scale", "prior", "debug", "history", "backtrack" },
-               ok = function(v) return type(v) == "table" end },
+        patterns = { "hit[%s_%.%-]?box" },
+        exclude = { "point", "scale", "prior", "debug", "history", "backtrack" },
+        ok = function(v) return type(v) == "table" end },
 }
 for i = 1, #ORDER_P do
     local sl = SL[ORDER_P[i]]
@@ -1803,10 +2322,10 @@ local PATH_TAGS = {
     { 6, { "rifle", "smg", "shotgun", "machine", "%f[%w]other%f[%W]" } },
 }
 
-local function tags_for(low)
+function Bind.tags_for(low)
     local tags
     for i = 1, #PATH_TAGS do
-        if any_match(low, PATH_TAGS[i][2]) then
+        if U.any_match(low, PATH_TAGS[i][2]) then
             tags = tags or {}
             tags[PATH_TAGS[i][1]] = true
         end
@@ -1836,19 +2355,19 @@ function Bind.add_path(sl, path, forced)
     sl.n = sl.n + 1
     -- orig: user's value (NONE until touched); cur: what config holds now; want: last desired
     -- value; eff: whether config accepted it.
-    sl.recs[sl.n] = { path = path, tags = tags_for(s_lower(path)), orig = NONE, cur = nil, want = nil,
+    sl.recs[sl.n] = { path = path, tags = Bind.tags_for(s_lower(path)), orig = NONE, cur = nil, want = nil,
                       eff = false, bad = 0, mism = 0, dead = false, warned = false, ro = false }
     return true
 end
 
-local function clear_pub()
+function Bind.clear_pub()
     if RB.hc ~= nil or RB.dmg ~= nil or RB.safe or RB.baim ~= nil or RB.strict or RB.pub_thp ~= nil then
         RB.hc, RB.dmg, RB.safe, RB.baim, RB.strict, RB.pub_thp = nil, nil, false, nil, false, nil
         VIS.dirty = true
     end
 end
 
-local function rec_fail(sl, rec, why)
+function Bind.fail(sl, rec, why)
     rec.bad = rec.bad + 1
     if rec.bad < K.BAD_LIMIT then
         sl.force = true
@@ -1862,9 +2381,9 @@ end
 function Bind.restore(sl, rec, final)
     if rec.orig == NONE then return true end
     if rec.dead and not final then return false end
-    if not same(rec.cur, rec.orig) then
+    if not U.same(rec.cur, rec.orig) then
         if not cfg_set(rec.path, rec.orig) then
-            rec_fail(sl, rec, "restore failed, original stays in the journal")
+            Bind.fail(sl, rec, "restore failed, original stays in the journal")
             return false
         end
         if CFG.log_cfg then say(format("%s <- %s (restore)", rec.path, fmt_v(rec.orig))) end
@@ -1876,7 +2395,7 @@ end
 
 -- Restores everything. A journal entry disappears only together with a successful restore.
 function Bind.release(final)
-    clear_pub()
+    Bind.clear_pub()
     if not RB.touched and not final then return end
     local pending = false
     for i = 1, #ORDER_P do
@@ -1897,18 +2416,23 @@ function Bind.scan()
     for i = 1, #ORDER_P do
         local sl = SL[ORDER_P[i]]
         sl.recs, sl.n, sl.w, sl.g, sl.force, sl.custom, sl.live, sl.full = {}, 0, nil, 0, false, false, 0, false
-        local list = CUSTOM_PATHS[sl.id]
-        if type(list) == "table" and #list > 0 then
-            sl.custom = true
-            for j = 1, #list do
-                if type(list[j]) == "string" then Bind.add_path(sl, list[j], true) end
+        local lists = { CUSTOM_PATHS[sl.id], PATHS_USER[sl.id] }
+        for li = 1, 2 do
+            local list = lists[li]
+            if type(list) == "table" then
+                for j = 1, #list do
+                    if type(list[j]) == "string" then
+                        sl.custom = true
+                        Bind.add_path(sl, list[j], true)
+                    end
+                end
             end
         end
     end
     RB.eval_at = 0
     local ok, keys = pcall(config.keys)
     if not ok or type(keys) ~= "table" then
-        say("config.keys unavailable: " .. tostring(keys) .. ". Fill CUSTOM_PATHS.")
+        say("config.keys unavailable: " .. tostring(keys) .. ". Set manual paths (CUSTOM_PATHS or a snapshot).")
         return false
     end
     for i = 1, #keys do
@@ -1918,15 +2442,15 @@ function Bind.scan()
             local excluded = nil
             for j = 1, #ORDER_P do
                 local sl = SL[ORDER_P[j]]
-                if not sl.custom and any_match(low, sl.patterns) then
-                    if excluded == nil then excluded = any_match(low, GENERIC_EXCLUDE) end
+                if not sl.custom and U.any_match(low, sl.patterns) then
+                    if excluded == nil then excluded = U.any_match(low, GENERIC_EXCLUDE) end
                     if excluded then break end
-                    if not any_match(low, sl.exclude) then
+                    if not U.any_match(low, sl.exclude) then
                         if sl.n < K.MAX_CANDS then
                             if Bind.add_path(sl, path, false) then break end
                         elseif not sl.full then
                             sl.full = true
-                            say(format("%s: more than %d paths found, extras skipped. Use CUSTOM_PATHS.", sl.title, K.MAX_CANDS))
+                            say(format("%s: more than %d paths found, extras skipped. Use manual paths.", sl.title, K.MAX_CANDS))
                         end
                     end
                 end
@@ -1966,7 +2490,7 @@ function Bind.dump()
                 tg = tconcat(t, ",")
             end
             say(format("   %s = %s  [weapon groups: %s]%s%s", r.path, fmt_v(cfg_get(r.path)), tg,
-                       r.dead and "  DISABLED" or "", r.ro and "  READ-ONLY" or ""))
+                r.dead and "  DISABLED" or "", r.ro and "  READ-ONLY" or ""))
         end
     end
 end
@@ -1991,17 +2515,17 @@ function Bind.push(sl, rec, target)
     if rec.orig == NONE then
         local cur = cfg_get(rec.path)
         if cur == nil then
-            rec_fail(sl, rec, "path no longer readable")
+            Bind.fail(sl, rec, "path no longer readable")
             return false
         end
         local pending = Journal.data[rec.path]
         if pending ~= nil and type(pending) == type(cur) then
-            rec.orig = copy(pending)              -- previous restore failed: the real original is in the journal
+            rec.orig = U.copy(pending)            -- previous restore failed: the real original is in the journal
         else
-            rec.orig = copy(cur)
+            rec.orig = U.copy(cur)
             Journal.add(rec.path, rec.orig)
         end
-        rec.cur, rec.want, rec.eff = copy(cur), nil, false
+        rec.cur, rec.want, rec.eff = U.copy(cur), nil, false
         RB.touched = true
     end
 
@@ -2016,34 +2540,34 @@ function Bind.push(sl, rec, target)
             val, supported = rec.orig, false
         end
     end
-    if rec.want ~= nil and same(rec.want, val) then return rec.eff end
+    if rec.want ~= nil and U.same(rec.want, val) then return rec.eff end
 
     local eff
-    if same(val, rec.orig) then
-        if not same(rec.cur, rec.orig) then
+    if U.same(val, rec.orig) then
+        if not U.same(rec.cur, rec.orig) then
             if not cfg_set(rec.path, rec.orig) then
-                rec_fail(sl, rec, "write rejected")
+                Bind.fail(sl, rec, "write rejected")
                 return false
             end
             if CFG.log_cfg then say(format("%s <- %s (equals yours)", rec.path, fmt_v(rec.orig))) end
-            rec.cur = copy(rec.orig)
+            rec.cur = U.copy(rec.orig)
         end
         eff = supported
     elseif cfg_set(rec.path, val) then
         local echo = cfg_get(rec.path)             -- config may clamp or round the value
         if echo == nil then echo = val end
-        rec.cur, rec.bad = copy(echo), 0
-        eff = not same(echo, rec.orig)
+        rec.cur, rec.bad = U.copy(echo), 0
+        eff = not U.same(echo, rec.orig)
         if not eff and not rec.ro then
             rec.ro = true
             say("write accepted but the value did not change: " .. rec.path .. " (wanted " .. fmt_v(val) .. ")")
         end
         if CFG.log_cfg then say(format("%s: %s -> %s", rec.path, fmt_v(rec.orig), fmt_v(echo))) end
     else
-        rec_fail(sl, rec, "write rejected")
+        Bind.fail(sl, rec, "write rejected")
         return false
     end
-    rec.want, rec.eff = copy(val), eff
+    rec.want, rec.eff = U.copy(val), eff
     return eff
 end
 
@@ -2074,7 +2598,7 @@ function Bind.verify()
             if rec.orig ~= NONE and not rec.dead then
                 local cur = cfg_get(rec.path)
                 if cur ~= nil then
-                    if same(cur, rec.cur) then
+                    if U.same(cur, rec.cur) then
                         rec.mism = 0
                     else
                         if not STATE.menu_open then rec.mism = rec.mism + 1 end
@@ -2084,7 +2608,7 @@ function Bind.verify()
                             Journal.remove(rec.path)
                             say("path disabled until rescan (constantly changed by other code): " .. rec.path)
                         else
-                            rec.orig, rec.cur, rec.want, rec.eff = copy(cur), copy(cur), nil, false
+                            rec.orig, rec.cur, rec.want, rec.eff = U.copy(cur), U.copy(cur), nil, false
                             Journal.add(rec.path, rec.orig)
                             sl.force = true
                         end
@@ -2097,19 +2621,19 @@ end
 
 -- ---------------------------------------------------------------- logic
 local HB = { cache = {}, n = 0 }
-local CAND, CAND_N = {}, 0
+local CAND = { list = {}, n = 0 }
 
-local function clear_target()
-    RB.t_hp, RB.t_air, RB.t_move, RB.t_name = nil, false, false, nil
+function RB.clear_target()
+    RB.t_hp, RB.t_air, RB.t_move = nil, false, false
     if RB.t_addr ~= nil then RB.t_addr, RB.baim_until = nil, 0 end
 end
 
 function RB.reset()
     HB.cache, HB.n = {}, 0
-    for i = 1, CAND_N do CAND[i].pawn = nil end
-    CAND_N = 0
+    for i = 1, CAND.n do CAND.list[i].pawn = nil end
+    CAND.n = 0
     RB.waddr, RB.wgroup, RB.state = nil, nil, nil
-    clear_target()
+    RB.clear_target()
     RB.baim_reason, RB.baim_until = nil, 0
     RB.base_hc, RB.base_dmg = nil, nil
     RB.land_soon, RB.air_ticks = false, 0
@@ -2122,21 +2646,20 @@ function RB.classify(w)
     if not ok or type(info) ~= "table" then return nil end
     if info.gun == false then return nil end
     local def = tonumber(info.def)
-    if def and WPN_BY_DEF[def] then return WPN_BY_DEF[def] end
-    if def and NON_GUN_DEF[def] then return nil end
+    if def and WPN.BY_DEF[def] then return WPN.BY_DEF[def] end
+    if def and WPN.NON_GUN_DEF[def] then return nil end
     local name = type(info.name) == "string" and s_lower(info.name) or ""
-    for i = 1, #WPN_BY_NAME do
-        if s_find(name, WPN_BY_NAME[i][1], 1, true) then return WPN_BY_NAME[i][2] end
+    for i = 1, #WPN.BY_NAME do
+        if s_find(name, WPN.BY_NAME[i][1], 1, true) then return WPN.BY_NAME[i][2] end
     end
-    for i = 1, #NON_GUN do
-        if s_find(name, NON_GUN[i], 1, true) then return nil end
-    end
+    if WPN.non_gun_name(name) then return nil end
     return 6
 end
 
 function RB.weapon(lp)
-    local w = lp:weapon()
+    local w = safe(lp.weapon, lp)
     if not w then
+        if RB.wgroup ~= nil then RB.eval_at, VIS.dirty = 0, true end
         RB.wgroup, RB.waddr = nil, nil
         return
     end
@@ -2152,16 +2675,14 @@ function RB.weapon(lp)
     end
 end
 
--- Landing prediction: will we touch the ground within land_ticks ticks?
+-- Landing prediction: will we touch the ground within land_ticks ticks? (createmove only)
 function RB.predict()
     local ok, sim = pcall(engine.simulate, CFG.land_ticks)
     if not ok or type(sim) ~= "table" then
         RB.sim_fail = RB.sim_fail + 1
-        if RB.sim_fail >= 3 then
-            RB.sim_fail = 0
-            say("engine.simulate unavailable, air detection switched to 'Ground + vertical speed'")
-            CFG.air_mode = 1
-            RB.sync_mode = 1                     -- widget is updated from paint
+        if RB.sim_fail >= 3 and not RB.sim_disabled then
+            RB.sim_disabled = true
+            notify("engine.simulate unavailable: landing prediction falls back to 'Ground + vertical speed'")
         end
         return
     end
@@ -2175,6 +2696,8 @@ function RB.predict()
     end
 end
 
+-- Local movement state. Runs every createmove (shot bookkeeping needs it even when the
+-- assist is off); the landing simulation only runs when the assist uses it.
 function RB.movement(lp, cmd)
     local vel = lp:velocity()
     local vx, vy, vz = 0, 0, 0
@@ -2187,6 +2710,7 @@ function RB.movement(lp, cmd)
         RB.air_ticks = RB.air_ticks + 1
     end
     local mode = CFG.air_mode
+    if mode == 3 and RB.sim_disabled then mode = 1 end
     local air = false
     if not grounded then
         if mode == 2 then
@@ -2195,16 +2719,15 @@ function RB.movement(lp, cmd)
             air = RB.air_ticks >= 2 and (abs(vz) >= CFG.air_thr or RB.air_ticks >= 10)
         end
     end
-    if air and mode == 3 then
-        -- Simulated every tick; a 1-3 tick lead would otherwise be late. While rising, landing
-        -- within land_ticks is impossible and the simulation is skipped.
+    if air and mode == 3 and CFG.rb_enable then
+        -- While rising, landing within land_ticks is impossible and the simulation is skipped.
         if not RB.land_soon and vz <= RB.g_tick * CFG.land_ticks + K.SIM_MARGIN then RB.predict() end
         if RB.land_soon then air = false end
     end
     local st
     if air then
         st = (CFG.apex_on and abs(vz) <= CFG.apex_win) and ST.APEX or ST.AIR
-    elseif band(lp:flags() or 0, K.FL_DUCKING) ~= 0 then
+    elseif band(safe(lp.flags, lp) or 0, K.FL_DUCKING) ~= 0 then
         st = ST.DUCK
     elseif speed < K.MOVE_EPS then
         st = ST.STAND
@@ -2213,12 +2736,9 @@ function RB.movement(lp, cmd)
     else
         st = ST.MOVE
     end
-    STATE.lp_air = air
+    STATE.lp_air = not grounded
     STATE.lp_moving = speed >= K.MOVE_EPS
-    if st ~= RB.state then
-        RB.state = st
-        VIS.dirty = true
-    end
+    RB.mstate = st
 end
 
 local function hg_from_name(s)
@@ -2261,7 +2781,7 @@ function RB.hitbox_ids(pawn)
 end
 
 function RB.dmg_at(eye, pawn, entry)
-    local pos = pawn:hitbox(entry.index)
+    local pos = safe(pawn.hitbox, pawn, entry.index)
     if not pos then return 0 end
     local ok, d = pcall(trace.damage, pawn, pos, entry.group, eye)
     if ok and type(d) == "number" then return d end
@@ -2276,24 +2796,24 @@ function RB.eval_targets(lp)
     local baim_ok = CFG.baim_on and (SL.baim.n + SL.hitbox.n) > 0
     local need_trace = baim_ok and (CFG.baim_lethal or CFG.baim_2x)
     local need_target = need_trace or (baim_ok and (CFG.baim_hp_on or CFG.baim_unres))
-                        or (CFG.dmg_cap and SL.dmg.n > 0)
-                        or ((CFG.hc_tgt_air ~= 0 or CFG.hc_tgt_move ~= 0 or CFG.unres_hc ~= 0) and SL.hc.n > 0)
+        or (CFG.dmg_cap and SL.dmg.n > 0)
+        or ((CFG.hc_tgt_air ~= 0 or CFG.hc_tgt_move ~= 0 or CFG.unres_hc ~= 0) and SL.hc.n > 0)
     if not need_target then
-        clear_target()
+        RB.clear_target()
         RB.baim_reason = nil
         return
     end
-    local eye, view = lp:eye_position(), engine.view_angles()
+    local eye, view = safe(lp.eye_position, lp), safe(engine.view_angles)
     if not eye or not view then
-        clear_target()
+        RB.clear_target()
         RB.baim_reason = nil
         return
     end
 
-    local ex, ey, ez = eye.x, eye.y, eye.z - K.EYE_OFFSET
-    local vp, vy, lim = view.x, view.y, CFG.baim_fov
+    local aim_from = vector(eye.x, eye.y, eye.z - K.EYE_OFFSET)   -- compare against target origin
+    local lim = CFG.baim_fov
     local players = entity.players()
-    local n = 0
+    local list, n = CAND.list, 0
     if type(players) == "table" then
         for i = 1, #players do
             local p = players[i]
@@ -2301,16 +2821,13 @@ function RB.eval_targets(lp)
             if pawn and pawn:alive() and pawn:is_enemy() then
                 local o = pawn:origin()
                 if o then
-                    local dx, dy, dz = o.x - ex, o.y - ey, o.z - ez
-                    local dp = normalize(deg(atan2(-dz, sqrt(dx * dx + dy * dy))) - vp)
-                    local dw = normalize(deg(atan2(dy, dx)) - vy)
-                    local fov = sqrt(dp * dp + dw * dw)
+                    local fov = U.fov(aim_from, o, view)
                     if fov <= lim then
                         n = n + 1
-                        local c = CAND[n]
+                        local c = list[n]
                         if not c then
                             c = {}
-                            CAND[n] = c
+                            list[n] = c
                         end
                         c.pawn, c.fov, c.hp, c.bd, c.hd = pawn, fov, 100, 0, 0
                     end
@@ -2318,18 +2835,19 @@ function RB.eval_targets(lp)
             end
         end
     end
-    for i = n + 1, CAND_N do CAND[i].pawn = nil end
-    CAND_N = n
+    for i = n + 1, CAND.n do list[i].pawn = nil end
+    CAND.n = n
 
+    -- Partial selection sort: only the MAX_TARGETS closest are traced.
     local pick = nil
     for i = 1, min(n, K.MAX_TARGETS) do
         local m = i
         for j = i + 1, n do
-            if CAND[j].fov < CAND[m].fov then m = j end
+            if list[j].fov < list[m].fov then m = j end
         end
-        if m ~= i then CAND[i], CAND[m] = CAND[m], CAND[i] end
-        local c = CAND[i]
-        c.hp = c.pawn:health() or 100
+        if m ~= i then list[i], list[m] = list[m], list[i] end
+        local c = list[i]
+        c.hp = safe(c.pawn.health, c.pawn) or 100
         if need_trace then
             local ids = RB.hitbox_ids(c.pawn)
             if ids then
@@ -2340,7 +2858,7 @@ function RB.eval_targets(lp)
                     if d >= need then break end
                 end
                 if CFG.baim_2x and ids.head and c.bd > 0 and c.bd * 2 >= need
-                   and not (CFG.baim_lethal and c.bd >= need) then
+                    and not (CFG.baim_lethal and c.bd >= need) then
                     c.hd = RB.dmg_at(eye, c.pawn, ids.head)
                 end
             end
@@ -2358,8 +2876,8 @@ function RB.eval_targets(lp)
         local addr = p:address()
         if addr ~= RB.t_addr then RB.t_addr, RB.baim_until = addr, 0 end
         RB.t_hp = pick.hp
-        RB.t_air = (p:on_ground() == false)
-        local pv = p:velocity()
+        RB.t_air = (safe(p.on_ground, p) == false)
+        local pv = safe(p.velocity, p)
         RB.t_move = (pv ~= nil) and (pv.x * pv.x + pv.y * pv.y > K.T_MOVE_SQR)
         if baim_ok then
             local hp, bd = pick.hp, pick.bd
@@ -2373,7 +2891,7 @@ function RB.eval_targets(lp)
             end
         end
     else
-        clear_target()
+        RB.clear_target()
     end
 
     if reason then
@@ -2383,7 +2901,7 @@ function RB.eval_targets(lp)
     end
 end
 
-local function set_pub(k, v)
+function RB.set_pub(k, v)
     if RB[k] ~= v then
         RB[k] = v
         VIS.dirty = true
@@ -2398,7 +2916,7 @@ function RB.decide(grp)
 
     -- resolver synergy: how much do we trust the guess for the crosshair target?
     local trec = RB.t_addr and RES.by_pawn[RB.t_addr] or nil
-    local unres = (trec ~= nil) and CFG.enable and RES.unresolved(trec)
+    local unres = (trec ~= nil) and CFG.enable and RES.unresolved(trec) or false
     RB.t_unres = unres
 
     -- hitchance
@@ -2447,7 +2965,7 @@ function RB.decide(grp)
     elseif RB.baim_reason then
         baim = RB.baim_reason
     elseif unres and CFG.baim_on and CFG.baim_unres then
-        baim = "RES"
+        baim = unres
     end
 
     local want_safe = want_safe_b and TRANSFORM or nil
@@ -2460,12 +2978,12 @@ function RB.decide(grp)
 
     -- the panel shows only what is really written into the ragebot
     local hc_live, safe_live = SL.hc.live > 0, SL.safe.live > 0
-    set_pub("hc", hc_live and hc or nil)
-    set_pub("dmg", (SL.dmg.live > 0) and dmg or nil)
-    set_pub("safe", (want_safe_b and safe_live) and true or false)
-    set_pub("baim", (SL.baim.live + SL.hitbox.live > 0) and baim or nil)
-    set_pub("strict", (strict and (hc_live or safe_live)) and true or false)
-    set_pub("pub_thp", RB.t_hp)
+    RB.set_pub("hc", hc_live and hc or nil)
+    RB.set_pub("dmg", (SL.dmg.live > 0) and dmg or nil)
+    RB.set_pub("safe", (want_safe_b and safe_live) and true or false)
+    RB.set_pub("baim", (SL.baim.live + SL.hitbox.live > 0) and baim or nil)
+    RB.set_pub("strict", (strict and (hc_live or safe_live)) and true or false)
+    RB.set_pub("pub_thp", RB.t_hp)
 end
 
 -- Not active this tick: restore the ragebot values; the panel hides the state.
@@ -2479,7 +2997,7 @@ function RB.stand_down(keep_state)
 end
 
 function RB.set_status(txt)
-    if UI.rb_status and not UI.rb_status.dummy then pcall(UI.rb_status.set, UI.rb_status, "Paths: " .. txt) end
+    if UI.rb_status and not is_dummy(UI.rb_status) then pcall(UI.rb_status.set, UI.rb_status, "Paths: " .. txt) end
 end
 
 function ACT.rescan()
@@ -2491,10 +3009,9 @@ end
 
 function ACT.dump() Bind.dump() end
 
--- Per-tick entry point (createmove).
-function RB.tick(cmd)
-    local now = STATE.rt
-    RB.cm_t = now
+-- Per-tick entry point (createmove). lp is alive when given.
+function RB.tick(cmd, lp)
+    RB.cm_t = STATE.rt
     RB.tick_n = RB.tick_n + 1
 
     if not CFG.rb_enable then
@@ -2509,21 +3026,23 @@ function RB.tick(cmd)
     end
     if RB.paused then RB.paused, VIS.dirty = false, true end
 
-    local lp = entity.local_pawn()
-    if not lp or not lp:alive() then
-        if RB.state ~= nil then RB.reset() end
+    if not lp then
+        if RB.state ~= nil or RB.wgroup ~= nil then RB.reset() end
         RB.stand_down(false)
         return
     end
 
     RB.weapon(lp)
     local grp = RB.wgroup
-    if not grp or not multi_on(CFG.weapons, grp, WPN_ITEMS) then
+    if not grp or not multi_on(CFG.weapons, grp, WPN.ITEMS) then
         RB.stand_down(false)
         return
     end
 
-    RB.movement(lp, cmd)
+    if RB.mstate ~= RB.state then
+        RB.state = RB.mstate
+        VIS.dirty = true
+    end
     if RB.tick_n >= RB.eval_at then
         RB.eval_at = RB.tick_n + K.EVAL_TICKS
         RB.eval_targets(lp)
@@ -2540,35 +3059,35 @@ function RB.housekeeping(now)
     local sw, sh = render.screen_size()
     if type(sw) == "number" and type(sh) == "number" and sw > 0 and sh > 0 then STATE.sw, STATE.sh = sw, sh end
     if SET.dirty and now - SET.dirty_t >= K.SAVE_DELAY then
-        if settings_save() then SET.dirty = false else SET.dirty_t = now + K.IO_RETRY end
+        if IO.save() then SET.dirty = false else SET.dirty_t = now + K.IO_RETRY end
     end
     Journal.flush(false)
+    if RES.store_dirty and now - RB.store_t > 30 then        -- crash safety for learned sides
+        RB.store_t = now
+        RES.store_save(false)
+    end
+    ESPX.sync()
     if STATE.strikes > 0 and now - STATE.strike_t > K.ERR_FORGIVE then STATE.strikes = 0 end
 end
 
 -- Background tasks run from paint; createmove takes over if paint goes silent.
 function RB.background(now)
-    if RB.sync_mode then
-        if REG.air_mode then write_el(REG.air_mode, RB.sync_mode) end
-        RB.sync_mode = false
-    end
     cfg_tick(false)
     -- menu_toggled can be missed: cross-check with input.menu_open after a short grace period
     if now - STATE.menu_evt_t > 0.25 and now - STATE.menu_poll_t > 0.25 then
         STATE.menu_poll_t = now
         local ok, open = pcall(input.menu_open)
         if ok and type(open) == "boolean" and open ~= STATE.menu_open then
-            STATE.menu_open = open
-            MENU.last = -1e9
+            RB.on_menu_toggled(open, true)
         end
     end
     if Journal.add_dirty then Journal.flush(false) end
     if now - RB.hk_t >= K.HK_INTERVAL then RB.housekeeping(now) end
 end
 
-function RB.on_menu_toggled(open)
+function RB.on_menu_toggled(open, polled)
     STATE.menu_open = open and true or false
-    STATE.menu_evt_t = STATE.rt
+    if not polled then STATE.menu_evt_t = STATE.rt end
     MENU.last = -1e9                             -- re-read the menu on the next frame
     if STATE.menu_open then
         if CFG.pause_menu and CFG.rb_enable then
@@ -2602,8 +3121,8 @@ VIS.memo, VIS.memo_n = {}, 0
 VIS.drag, VIS.px, VIS.py, VIS.was_down = nil, nil, nil, false
 VIS.panel_x, VIS.panel_y, VIS.panel_bottom = nil, nil, nil
 
-local IND_KEYS = { "MODE", "HC", "DMG", "SAFE", "BAIM", "STRICT", "TARGET", "AA", "YAW", "CONF", "PITCH", "HITS" }
-local IND_VALS = { "PAUSE", "100%", "130", "ON", "LETHAL", "100 HP", "JITTER L", "+180°", "FLICK", "99/99" }
+VIS.IND_KEYS = { "SELF", "MODE", "HC", "DMG", "SAFE", "BAIM", "STRICT", "TARGET", "AA", "YAW", "CONF", "PITCH", "HITS", "LC" }
+VIS.IND_VALS = { "PAUSE", "100%", "130", "ON", "LETHAL", "100 HP", "JITTER L*", "+180°", "FLICK", "99/99", "BREAK", "FREESTAND", "STANDING" }
 
 function VIS.init()
     local ok, f = pcall(render.font, "Segoe UI", 13)
@@ -2629,10 +3148,10 @@ function VIS.measure(str, size)
         ok, w, h = pcall(render.text_size, str, "", size)
     end
     if ok and type(w) == "number" then return w, (type(h) == "number") and h or size end
-    return utf8_len(str) * size * 0.55, size
+    return U.utf8_len(str) * size * 0.55, size
 end
 
-local function text_w(str)
+function VIS.text_w(str)
     local w = VIS.memo[str]
     if not w then
         if VIS.memo_n >= K.MEMO_MAX then VIS.memo, VIS.memo_n = {}, 0 end
@@ -2676,26 +3195,29 @@ function VIS.palette(slot, qa)
 end
 
 -- ---------------------------------------------------------------- overlay
-local function side_label(rec) return (rec.pred_side > 0) and "L" or "R" end
+function VIS.side_label(rec) return ((rec.pred_side > 0) and "L" or "R") .. (rec.manual and "*" or "") end
+
+function VIS.live(rec, rt) return rec.pawn and rec.resolved and rt - rec.seen_rt < 0.1 end
 
 function VIS.overlay(rt, P)
     local detailed = (CFG.ov_style == 2)
     local focus = RES.focus
     for _, rec in pairs(RES.records) do
-        if rec.pawn and rec.resolved and rt - rec.seen_rt < 0.1 then
+        if VIS.live(rec, rt) then
             local ok, l, t, r = pcall(rec.pawn.bbox, rec.pawn)
             if ok and type(l) == "number" and type(t) == "number" and type(r) == "number" then
-                local col = rec.applied and P.val or P.key
+                local col = rec.lc and P.warn or (rec.applied and P.val or P.key)
                 local dlt = normalize(rec.resolved_yaw - rec.raw_yaw)
-                local txt = format("%s %s %d°", MODE_LABEL[rec.mode] or "?", side_label(rec), round(abs(dlt)))
-                local w = render.text_size(txt)
+                local txt = format("%s %s %d°%s", MODE_LABEL[rec.mode] or "?", VIS.side_label(rec), round(abs(dlt)), rec.lc and " LC" or "")
+                local w = render.text_size(txt) or 0
                 local cx = (l + r) * 0.5
                 local y = t - (detailed and 30 or 16)
                 render.text(cx - w * 0.5, y, col, txt)
                 if detailed then
-                    local sub = format("%d/%d · b%d%s", rec.hits, rec.misses, rec.brute_idx,
-                        rec.pitch_kind ~= "" and (" · " .. rec.pitch_kind) or "")
-                    local sw = render.text_size(sub)
+                    local sub = format("%d/%d · b%d%s%s", rec.hits, rec.misses, rec.brute_idx,
+                        rec.pitch_kind ~= "" and (" · " .. rec.pitch_kind) or "",
+                        rec.last_reason and (" · " .. rec.last_reason) or "")
+                    local sw = render.text_size(sub) or 0
                     render.text(cx - sw * 0.5, y + 13, P.key, sub)
                     local bw = clamp(r - l, 24, 60)
                     local bx = cx - bw * 0.5
@@ -2713,7 +3235,7 @@ end
 -- Short lines from the head: received yaw (dim) and resolved yaw (accent).
 function VIS.yaw_lines(rt, P)
     for _, rec in pairs(RES.records) do
-        if rec.pawn and rec.resolved and rt - rec.seen_rt < 0.1 then
+        if VIS.live(rec, rt) then
             local head = safe(rec.pawn.eye_position, rec.pawn) or rec.en_eye
             if head then
                 local sx, sy = render.world_to_screen(head)
@@ -2735,9 +3257,9 @@ end
 function VIS.layout(size)
     VIS.size, VIS.memo, VIS.memo_n = size, {}, 0
     local kw, vw = 0, 0
-    for i = 1, #IND_KEYS do kw = max(kw, text_w(IND_KEYS[i])) end
-    for i = 1, #IND_VALS do vw = max(vw, text_w(IND_VALS[i])) end
-    for i = 1, #ST_NAME do vw = max(vw, text_w(ST_NAME[i])) end
+    for i = 1, #VIS.IND_KEYS do kw = max(kw, VIS.text_w(VIS.IND_KEYS[i])) end
+    for i = 1, #VIS.IND_VALS do vw = max(vw, VIS.text_w(VIS.IND_VALS[i])) end
+    for i = 1, #ST_NAME do vw = max(vw, VIS.text_w(ST_NAME[i])) end
     local pad = floor(size * 0.8)
     local tw, th = VIS.measure("0x", size + 2)
     local vwid = VIS.measure(VIS.ver, size - 2)
@@ -2745,39 +3267,41 @@ function VIS.layout(size)
     VIS.w = max(pad * 2 + kw + 18 + vw, pad * 2 + tw + 6 + vwid + 40, floor(size * 13))
 end
 
-local function put_row(i, k, value, kind, frac)
+function VIS.put_row(i, k, value, kind, frac)
     local r = VIS.rows[i]
     if not r then
         r = {}
         VIS.rows[i] = r
     end
-    r[1], r[2], r[3], r[4], r[5] = k, value, kind, text_w(value), frac
+    r[1], r[2], r[3], r[4], r[5] = k, value, kind, VIS.text_w(value), frac
     return i + 1
 end
 
 function VIS.rebuild(rb_show, rec)
-    local n = 1
+    local put, n = VIS.put_row, 1
+    if CFG.aa_on then n = put(n, "SELF", AA.label_txt, AA.active and 2 or 3) end
     if rb_show then
-        n = put_row(n, "MODE", RB.paused and "PAUSE" or (RB.state and ST_NAME[RB.state] or "—"), 1)
-        if RB.hc then n = put_row(n, "HC", RB.hc .. "%", 1) end
-        if RB.dmg then n = put_row(n, "DMG", tostring(RB.dmg), 1) end
-        if RB.safe then n = put_row(n, "SAFE", "ON", 2) end
-        if RB.baim then n = put_row(n, "BAIM", RB.baim, 3) end
-        if RB.strict then n = put_row(n, "STRICT", "ON", 2) end
-        if RB.pub_thp then n = put_row(n, "TARGET", RB.pub_thp .. " HP", 1) end
+        n = put(n, "MODE", RB.paused and "PAUSE" or (RB.state and ST_NAME[RB.state] or "—"), 1)
+        if RB.hc then n = put(n, "HC", RB.hc .. "%", 1) end
+        if RB.dmg then n = put(n, "DMG", tostring(RB.dmg), 1) end
+        if RB.safe then n = put(n, "SAFE", "ON", 2) end
+        if RB.baim then n = put(n, "BAIM", RB.baim, 3) end
+        if RB.strict then n = put(n, "STRICT", "ON", 2) end
+        if RB.pub_thp then n = put(n, "TARGET", RB.pub_thp .. " HP", 1) end
     end
     if rec then
-        n = put_row(n, "AA", (MODE_LABEL[rec.mode] or "?") .. " " .. side_label(rec), rec.applied and 2 or 1)
-        n = put_row(n, "YAW", format("%+d°", round(normalize(rec.resolved_yaw - rec.raw_yaw))), 1)
-        if rec.pitch_kind ~= "" then n = put_row(n, "PITCH", rec.pitch_kind, 3) end
-        n = put_row(n, "CONF", format("%d%%", round(rec.conf * 100)), 4, rec.conf)
-        n = put_row(n, "HITS", format("%d/%d", rec.hits, rec.misses), 1)
+        n = put(n, "AA", (MODE_LABEL[rec.mode] or "?") .. " " .. VIS.side_label(rec), rec.applied and 2 or 1)
+        n = put(n, "YAW", format("%+d°", round(normalize(rec.resolved_yaw - rec.raw_yaw))), 1)
+        if rec.pitch_kind ~= "" then n = put(n, "PITCH", rec.pitch_kind, 3) end
+        if rec.lc then n = put(n, "LC", "BREAK", 3) end
+        n = put(n, "CONF", format("%d%%", round(rec.conf * 100)), 4, rec.conf)
+        n = put(n, "HITS", format("%d/%d", rec.hits, rec.misses), 1)
     end
     VIS.nrows = n - 1
     VIS.h = VIS.pad * 2 + VIS.th + 8 + VIS.nrows * VIS.rh + ((rb_show and RB.hc) and 8 or 0)
 end
 
-local function commit_drag(w, h)
+function VIS.commit_drag(w, h)
     local nx = clamp(round(VIS.px / max(1, STATE.sw - w) * 100), 0, 100)
     local ny = clamp(round(VIS.py / max(1, STATE.sh - h) * 100), 0, 100)
     if REG.panel_x then write_el(REG.panel_x, nx) end
@@ -2787,28 +3311,37 @@ local function commit_drag(w, h)
     SET.dirty, SET.dirty_t = true, STATE.rt
 end
 
+-- true when the cursor is over the Neverlose menu window (clicks there belong to the menu).
+function VIS.over_menu(mx, my)
+    local p, s = safe(ui.position), safe(ui.size)
+    if type(p) ~= "table" or type(s) ~= "table" or type(p.x) ~= "number" or type(s.x) ~= "number" then return false end
+    return mx >= p.x and mx <= p.x + s.x and my >= p.y and my <= p.y + s.y
+end
+
 -- Panel position; draggable with the left mouse button while the menu is open.
 function VIS.position(w, h)
     local x = floor((STATE.sw - w) * CFG.panel_x / 100)
     local y = floor((STATE.sh - h) * CFG.panel_y / 100)
     if STATE.menu_open then
         local ok, mx, my = pcall(input.cursor)
-        local down = safe(input.key_down, 1) == true
+        local down = safe(input.key_down, K.VK_LBUTTON) == true
         if ok and type(mx) == "number" and type(my) == "number" then
             if VIS.drag then
                 if down then
-                    VIS.px, VIS.py = mx - VIS.drag.dx, my - VIS.drag.dy
+                    VIS.px = clamp(mx - VIS.drag.dx, 0, max(0, STATE.sw - w))
+                    VIS.py = clamp(my - VIS.drag.dy, 0, max(0, STATE.sh - h))
                 else
-                    commit_drag(w, h)
+                    VIS.commit_drag(w, h)
                 end
-            elseif down and not VIS.was_down and mx >= x and mx <= x + w and my >= y and my <= y + h then
+            elseif down and not VIS.was_down and mx >= x and mx <= x + w and my >= y and my <= y + h
+                and not VIS.over_menu(mx, my) then
                 VIS.drag = { dx = mx - x, dy = my - y }
                 VIS.px, VIS.py = x, y
             end
         end
         VIS.was_down = down
     else
-        if VIS.drag then commit_drag(w, h) end
+        if VIS.drag then VIS.commit_drag(w, h) end
         VIS.was_down = false
     end
     if VIS.px then return VIS.px, VIS.py end
@@ -2819,10 +3352,10 @@ function VIS.panel(rt)
     local rb_show = CFG.rb_enable and (RB.state ~= nil or RB.paused)
     local rec = CFG.enable and RES.focus or nil
     if rec and (not rec.resolved or rt - rec.seen_rt > 0.5) then rec = nil end
-    local show = (rb_show or rec ~= nil) and RB.in_game
+    local show = (rb_show or rec ~= nil or (CFG.aa_on and AA.why ~= "OFF" and AA.why ~= "DEAD")) and RB.in_game
     local a = VIS.a
     if not show and a == 0 then return end
-    a = a + ((show and 1 or 0) - a) * min(1, globals.frametime() * 10)
+    a = a + ((show and 1 or 0) - a) * min(1, (safe(globals.frametime) or 0.016) * 10)
     if a < 0.02 then
         VIS.a = show and a or 0
         return
@@ -2847,7 +3380,7 @@ function VIS.panel(rt)
 
     render.rect_filled(x, y, w, h, P.bg, 7)
     render.rect(x, y, w, h, P.line, 7, 1)
-    render.rect_filled(x + 1, y + 10, 2, h - 20, P.acc, 1)
+    render.rect_filled(x + 1, y + 10, 2, max(1, h - 20), P.acc, 1)
     VIS.text(x + pad, y + pad - 1, P.acc, "0x", size + 2)
     VIS.text(x + pad + VIS.tw + 6, y + pad + 1, P.key, VIS.ver, size - 2)
     local ry = y + pad + VIS.th + 8
@@ -2890,14 +3423,13 @@ function VIS.feed_draw(rt, P)
     end
     for i = 1, #feed do
         local e = feed[i]
-        local left = C.FEED_LIFE - (rt - e.t)
-        local a = clamp(left, 0, 1)
+        local a = clamp(C.FEED_LIFE - (rt - e.t), 0, 1)
         local col = P.val
         if e.kind == "hit" then col = P.good
         elseif e.kind == "miss" then col = P.warn
         elseif e.kind == "kill" then col = P.acc
         elseif e.kind == "info" then col = P.key end
-        VIS.text(x + 2, y, col:alpha(floor(col.a * a)), e.text, size)
+        VIS.text(x + 2, y, (a < 1) and col:alpha(floor(col.a * a)) or col, e.text, size)
         y = y + size + 4
     end
 end
@@ -2906,31 +3438,42 @@ end
 function VIS.debug(rt, P)
     local x, y = 24, 120
     local rows = {}
+    local s = RES.stats
     rows[#rows + 1] = format("%s v%s  insecure=%s write=%s simtime=%s body=%s pending=%d focus=%s",
         META.name, META.version, tostring(RES.insecure), tostring(RES.write_ok), tostring(RES.simtime_ok),
         tostring(RES.body_ok), #RES.pending, RES.focus and tostring(RES.focus.name) or "-")
-    rows[#rows + 1] = format("ragebot: on=%s state=%s grp=%s hc=%s dmg=%s safe=%s baim=%s unres=%s paths=%s touched=%s",
+    rows[#rows + 1] = format("ragebot: on=%s state=%s grp=%s hc=%s dmg=%s safe=%s baim=%s unres=%s paths=%s touched=%s sim=%s",
         tostring(CFG.rb_enable), RB.state and ST_NAME[RB.state] or "-", tostring(RB.wgroup), tostring(RB.hc),
-        tostring(RB.dmg), tostring(RB.safe), tostring(RB.baim), tostring(RB.t_unres), Bind.summary(), tostring(RB.touched))
+        tostring(RB.dmg), tostring(RB.safe), tostring(RB.baim), tostring(RB.t_unres), Bind.summary(), tostring(RB.touched),
+        RB.sim_disabled and "off" or "on")
+    rows[#rows + 1] = format("shots=%d hits=%d heads=%d misses=%d  [resolver %d · spread %d · lagcomp %d · moving %d · air %d]",
+        s.shots, s.hits, s.heads, s.misses, s.resolver, s.spread, s.lagcomp, s.moving, s.airborne)
+    local hw = RES.hw
+    rows[#rows + 1] = format("hint weights: body %.2f · freestand %.2f · move %.2f · movedir %.2f   misses: death %d · lost %d",
+        hw.b, hw.fs, hw.mv, hw.md, s.death, s.lost)
     for _, rec in pairs(RES.records) do
         if rt - rec.seen_rt < 1 then
             local m = RES.brute_entry(rec)
             rows[#rows + 1] = format(
-                "%-14s %-6s side=%s conf=%.2f score=%+.2f brute=%d(%+.2f) body=%+d fs=%+d mv=%+.1f md=%+d ab=%d amt=%d res=%d raw=%d p=%s h/m=%d/%d%s",
-                tostring(rec.name):sub(1, 14), MODE_LABEL[rec.mode] or "?", side_label(rec), rec.conf, rec.score,
+                "%-14s %-6s side=%s conf=%.2f score=%+.2f brute=%d(%+.2f) body=%+d fs=%+d mv=%+.1f md=%+d ab=%d amt=%d res=%d raw=%d p=%s h/m=%d/%d%s%s",
+                s_sub(tostring(rec.name), 1, 14), MODE_LABEL[rec.mode] or "?", VIS.side_label(rec), rec.conf, rec.score,
                 rec.brute_idx, m, round(rec.body_delta), rec.fs_hint, rec.mv_hint, rec.md_hint, rec.ab_score,
                 round(rec.amount), round(rec.resolved_yaw), round(rec.raw_yaw), rec.pitch_kind ~= "" and rec.pitch_kind or "-",
-                rec.hits, rec.misses, rec.applied and "" or " [track]")
+                rec.hits, rec.misses, rec.lc and " [LC]" or "", rec.applied and "" or " [track]")
+            if rec.mode == "jitter" then
+                rows[#rows + 1] = format("   jitter: half=%d period=%d run=%d conf=%.2f k=%s", round(rec.jit_half), rec.jit_period,
+                    rec.jit_run, rec.jit_pconf, rec.jit_k and format("%+.1f", rec.jit_k) or "legacy")
+            end
         end
     end
     local wmax = 0
     for i = 1, #rows do
-        local w = render.text_size(rows[i])
+        local w = render.text_size(rows[i]) or 0
         if w > wmax then wmax = w end
     end
     render.rect_filled(x - 8, y - 6, wmax + 16, #rows * 15 + 12, color(12, 12, 14, 200), 4)
     for i = 1, #rows do
-        render.text(x, y + (i - 1) * 15, i <= 2 and P.acc or P.key, rows[i])
+        render.text(x, y + (i - 1) * 15, i <= 4 and P.acc or P.key, rows[i])
     end
 end
 
@@ -2942,9 +3485,10 @@ function VIS.stats(rt)
     for _, rec in pairs(RES.records) do
         if rt - rec.seen_rt < 1 then tracked = tracked + 1 end
     end
-    if UI.stats and not UI.stats.dummy then
-        pcall(UI.stats.set, UI.stats, format("tracked %d · shots %d · hits %d · misses %d · write %s",
-            tracked, RES.total_shots, RES.total_hits, RES.total_misses,
+    local s = RES.stats
+    if UI.stats and not is_dummy(UI.stats) then
+        pcall(UI.stats.set, UI.stats, format("tracked %d · hits %d (%d hs) · misses %d (res %d · spread %d · lc %d) · write %s",
+            tracked, s.hits, s.heads, s.misses, s.resolver, s.spread, s.lagcomp,
             RES.write_ok == true and "on" or (RES.write_ok == false and "off" or "n/a")))
     end
 end
@@ -2952,7 +3496,7 @@ end
 function VIS.paint()
     local rt = STATE.rt
     VIS.stats(rt)
-    if not CFG.enable and not CFG.rb_enable then
+    if not CFG.enable and not CFG.rb_enable and not CFG.aa_on then
         VIS.a = 0
         return
     end
@@ -2963,7 +3507,328 @@ function VIS.paint()
     end
     if CFG.panel then VIS.panel(rt) else VIS.a = 0 end
     if CFG.feed and RB.in_game then VIS.feed_draw(rt, P) end
+    if CFG.aa_on and RB.in_game then AA.arrows(P) end
     if CFG.debug and CFG.enable then VIS.debug(rt, P) end
+end
+
+-- ============================================================================
+--  NATIVE ESP FLAG (esp.add_text) — created only while the option is on
+-- ============================================================================
+ESPX.name, ESPX.el = "0x resolver", nil
+
+function ESPX.text(ent)
+    if not ent or not CFG.enable or not CFG.esp_flag then return nil end
+    local rec = RES.record_by_pawn(ent)
+    if not rec then
+        local p = safe(ent.pawn, ent)                 -- the element may receive a controller
+        rec = p and RES.record_by_pawn(p) or nil
+    end
+    if not rec or not rec.resolved or (safe(globals.realtime) or 0) - rec.seen_rt > 0.5 then return nil end
+    return format("%s %s%s", MODE_LABEL[rec.mode] or "?", VIS.side_label(rec), rec.lc and " LC" or "")
+end
+
+function ESPX.sync()
+    local want = CFG.enable and CFG.esp_flag
+    if want and not ESPX.el then
+        if type(esp) ~= "table" or type(esp.add_text) ~= "function" then return end
+        local ok, el = pcall(esp.add_text, ESPX.name, function(ent)
+            if STATE.failed then return nil end
+            local ok2, v = pcall(ESPX.text, ent)
+            if ok2 then return v end
+            return nil
+        end, { side = "right", small = true })
+        if ok and el then
+            ESPX.el = el
+        else
+            say("native ESP flag unavailable: " .. tostring(el))
+            CFG.esp_flag = false
+            if REG.esp_flag then write_el(REG.esp_flag, false) end
+        end
+    elseif not want and ESPX.el then
+        ESPX.remove()
+    end
+end
+
+function ESPX.remove()
+    if not ESPX.el then return end
+    if not pcall(esp.remove, ESPX.name) then pcall(ESPX.el.remove, ESPX.el) end
+    ESPX.el = nil
+end
+
+-- ============================================================================
+--  ANTI-AIM
+--  There is no anti-aim module in the API: the angles are written into the command
+--  (cmd:set_view_angles) in createmove and the movement is kept camera-relative.
+-- ============================================================================
+AA.t, AA.active, AA.why, AA.src, AA.label_txt = 0, false, "OFF", "BUILDER", "OFF"
+AA.manual, AA.key_prev, AA.edit_shown = nil, {}, nil
+AA.at_yaw, AA.knife_yaw, AA.t_eye, AA.scan_t, AA.fs_side = nil, nil, nil, -1e9, 0
+AA.hurt_until, AA.hurt_sign, AA.rand, AA.rand_phase = -1e9, 1, 0, -1
+AA.fails, AA.dead, AA.rot_ok = 0, false, true
+AA.fs_opts = { mask = E.MASK_VISIBLE }
+AA.STATE_OF = { [ST.STAND] = 2, [ST.SLOW] = 3, [ST.MOVE] = 4, [ST.DUCK] = 5, [ST.AIR] = 6, [ST.APEX] = 6 }
+AA.FIELDS = { "on", "pitch", "pitch_v", "base", "yaw", "mod", "range", "delay", "speed" }
+AA.MANUAL = { { "k_aa_left", 90, "LEFT" }, { "k_aa_right", -90, "RIGHT" }, { "k_aa_back", 180, "BACK" }, { "k_aa_fwd", 0, "FWD" } }
+AA.SEQ3, AA.SEQ5 = { -1, 0, 1 }, { -1, -0.5, 0, 0.5, 1 }
+AA.KEYS = {}
+for i = 1, #ITEMS.AA_STATE do
+    local t = {}
+    for j = 1, #AA.FIELDS do t[AA.FIELDS[j]] = "aa" .. i .. "_" .. AA.FIELDS[j] end
+    AA.KEYS[i] = t
+end
+
+-- Only the widgets of the condition selected in "Edit condition" are shown.
+function AA.sync_menu()
+    local edit = CFG.aa_edit or 1
+    if edit == AA.edit_shown then return end
+    AA.edit_shown = edit
+    for i = 1, #AA.KEYS do
+        for j = 1, #AA.FIELDS do
+            local r = REG[AA.KEYS[i][AA.FIELDS[j]]]
+            if r and not is_dummy(r.el) then pcall(r.el.visible, r.el, i == edit) end
+        end
+    end
+end
+
+function AA.set_label(txt)
+    if AA.label_txt ~= txt then
+        AA.label_txt = txt
+        VIS.dirty = true
+    end
+end
+
+function AA.idle(why)
+    AA.active, AA.why = false, why
+    AA.set_label(why)
+end
+
+-- "gun" | "knife" | "other" (grenades, C4, ...) | "none", plus the weapon definition index.
+function AA.weapon_kind(pawn)
+    local info = safe(pawn.weapon_info, pawn)
+    if type(info) ~= "table" then return "none", nil end
+    local name = type(info.name) == "string" and s_lower(info.name) or ""
+    if s_find(name, "knife", 1, true) or s_find(name, "bayonet", 1, true) then return "knife", tonumber(info.def) end
+    if info.gun == false or WPN.non_gun_name(name) then return "other", tonumber(info.def) end
+    return "gun", tonumber(info.def)
+end
+
+-- The most recently activated manual bind wins; releasing it falls back to another active one.
+function AA.update_manual()
+    local cur, prev = AA.manual, AA.key_prev
+    for i = 1, #AA.MANUAL do
+        local on = bind_on(UI[AA.MANUAL[i][1]])
+        if on and not prev[i] then cur = i end
+        prev[i] = on
+    end
+    if cur and not prev[cur] then
+        cur = nil
+        for i = 1, #AA.MANUAL do
+            if prev[i] then cur = i break end
+        end
+    end
+    AA.manual = cur
+end
+
+-- At-target enemy and the closest knife carrier (createmove only: entity reads + traces).
+function AA.scan(lp, eye, view)
+    AA.at_yaw, AA.knife_yaw, AA.t_eye = nil, nil, nil
+    local players = safe(entity.players)
+    if type(players) ~= "table" then return end
+    local by_dist = (CFG.aa_target == 2)
+    local best, best_v = nil, 1e9
+    local knife_d = CFG.aa_knife and CFG.aa_knife_dist or 0
+    for i = 1, #players do
+        local p = players[i]
+        local pawn = type(p) == "table" and p.pawn or nil
+        if pawn and safe(pawn.alive, pawn) == true and safe(pawn.is_enemy, pawn) == true then
+            local pe = safe(pawn.eye_position, pawn)
+            if pe then
+                local dist = eye:dist(pe)
+                local v = by_dist and dist or U.fov(eye, pe, view)
+                if v < best_v then best, best_v = pe, v end
+                if dist < knife_d and AA.weapon_kind(pawn) == "knife" then
+                    knife_d = dist
+                    AA.knife_yaw = U.yaw_to(eye, pe)
+                end
+            end
+        end
+    end
+    if best then AA.at_yaw, AA.t_eye = U.yaw_to(eye, best), best end
+end
+
+-- +1: the point left of our head is hidden from the target, -1: the right one, 0: no decision.
+function AA.freestand(lp, eye)
+    local te = AA.t_eye
+    if not te then return 0 end
+    local a = rad(U.yaw_to(eye, te))
+    local lx, ly = -sin(a) * K.AA_FS_OFFSET, cos(a) * K.AA_FS_OFFSET     -- our left while facing him
+    AA.fs_opts.skip = lp
+    local tl = safe(trace.line, te, vector(eye.x + lx, eye.y + ly, eye.z), AA.fs_opts)
+    local tr = safe(trace.line, te, vector(eye.x - lx, eye.y - ly, eye.z), AA.fs_opts)
+    AA.fs_opts.skip = nil
+    if type(tl) ~= "table" or type(tr) ~= "table" then return 0 end
+    local bl, br = (tonumber(tl.fraction) or 1) < 0.98, (tonumber(tr.fraction) or 1) < 0.98
+    if bl == br then return 0 end
+    return bl and 1 or -1
+end
+
+-- Yaw modifier of a condition, degrees. shifted = one phase ahead (shuffle when hit).
+function AA.modifier(k, shifted)
+    local mod = CFG[k.mod]
+    if mod == 1 then return 0 end
+    local range = CFG[k.range]
+    local phase = floor(AA.t / max(1, CFG[k.delay])) + (shifted and 1 or 0)
+    if mod == 2 then return ((phase % 2 == 0) and 0.5 or -0.5) * range end
+    if mod == 3 then return (phase % 2 == 0) and range or 0 end
+    if mod == 4 then return AA.SEQ3[phase % 3 + 1] * range * 0.5 end
+    if mod == 5 then return AA.SEQ5[phase % 5 + 1] * range * 0.5 end
+    if mod == 6 then return (AA.t * CFG[k.speed]) % 360 end
+    if mod == 7 then return sin(rad(AA.t * CFG[k.speed])) * range * 0.5 end
+    if phase ~= AA.rand_phase then
+        AA.rand_phase, AA.rand = phase, (math.random() - 0.5) * range
+    end
+    return AA.rand
+end
+
+-- Keeps the movement relative to the camera yaw (cam) after the command yaw became yaw.
+function AA.fix_movement(cmd, cam, yaw)
+    local fix = CFG.aa_fix
+    if fix == 3 then return end
+    if fix == 1 and AA.rot_ok then
+        if pcall(cmd.rotate_movement, cmd, cam) then return end
+        AA.rot_ok = false
+        say("cmd:rotate_movement failed; the manual movement fix is used instead")
+    end
+    local ok, f, sd = pcall(cmd.move, cmd)
+    if not ok or type(f) ~= "number" or type(sd) ~= "number" or (f == 0 and sd == 0) then return end
+    local inv = CFG.aa_fix_inv
+    local l = inv and -sd or sd                               -- left-positive unless inverted
+    local d = rad(normalize(yaw - cam))
+    local cd, sn = cos(d), sin(d)
+    local nf, nl = f * cd + l * sn, l * cd - f * sn
+    pcall(cmd.set_move, cmd, nf, inv and -nl or nl)
+end
+
+-- Per-tick entry point (createmove, after the ragebot assist). lp is alive when given.
+function AA.run(cmd, lp)
+    if not CFG.aa_on then return AA.idle("OFF") end
+    if AA.dead then return AA.idle("ERROR") end
+    if not lp then return AA.idle("DEAD") end
+    AA.t = AA.t + 1
+    AA.update_manual()
+
+    -- situations in which the real angles must reach the server
+    if bind_on(UI.k_aa_off) then return AA.idle("KEY") end
+    if cmd:has(K.BTN_ATTACK) then return AA.idle("SHOT") end
+    local kind, def = AA.weapon_kind(lp)
+    if kind == "other" or kind == "none" then return AA.idle("ITEM") end
+    if cmd:has(K.BTN_ATTACK2) and (kind == "knife" or def == K.DEF_REVOLVER) then return AA.idle("SHOT") end
+    if CFG.aa_use and cmd:has(K.BTN_USE) then return AA.idle("USE") end
+    if CFG.aa_freeze and safe(game.freeze_time) == true then return AA.idle("FREEZE") end
+    if CFG.aa_warmup and safe(game.warmup) == true then return AA.idle("WARMUP") end
+    if CFG.aa_ladder then
+        local ps = safe(engine.post_state)
+        local mt = type(ps) == "table" and ps.move_type or nil
+        if mt == K.MT_LADDER or mt == K.MT_NOCLIP then return AA.idle("LADDER") end
+    end
+
+    local view, eye = safe(cmd.view_angles, cmd), safe(lp.eye_position, lp)
+    if not view or not eye then return AA.idle("N/A") end
+    local cam = view.y
+
+    local fs_on = CFG.aa_fs_always or bind_on(UI.k_aa_fs)
+    if AA.t - AA.scan_t >= K.AA_SCAN_TICKS or AA.t < AA.scan_t then
+        AA.scan_t = AA.t
+        AA.scan(lp, eye, view)
+        AA.fs_side = fs_on and AA.freestand(lp, eye) or 0
+    end
+
+    local si = AA.STATE_OF[RB.mstate or ST.STAND] or 2
+    if not CFG[AA.KEYS[si].on] then si = 1 end
+    local k = AA.KEYS[si]
+
+    local yaw, src, static
+    local m = AA.manual
+    if m then
+        yaw, src, static = cam + AA.MANUAL[m][2], AA.MANUAL[m][3], CFG.aa_manual_static
+    elseif AA.knife_yaw then
+        yaw, src, static = AA.knife_yaw, "KNIFE", true
+    elseif fs_on and AA.fs_side ~= 0 and AA.at_yaw then
+        yaw, src, static = AA.at_yaw + AA.fs_side * 90, "FREESTAND", CFG.aa_fs_static
+    else
+        yaw, src, static = ((CFG[k.base] == 2 and AA.at_yaw) or cam) + CFG[k.yaw], "BUILDER", false
+    end
+    local hurt = STATE.rt < AA.hurt_until
+    if not static then yaw = yaw + AA.modifier(k, hurt) end
+    if hurt and src == "BUILDER" then yaw = yaw + AA.hurt_sign * CFG.aa_hurt_off end
+
+    local pm, pitch = CFG[k.pitch], view.x
+    if pm == 2 then pitch = 89 elseif pm == 3 then pitch = -89 elseif pm == 4 then pitch = 0
+    elseif pm == 5 then pitch = CFG[k.pitch_v] end
+    pitch, yaw = clamp(pitch, -89, 89), normalize(yaw)
+
+    if not pcall(cmd.set_view_angles, cmd, vector(pitch, yaw, 0)) then
+        AA.fails = AA.fails + 1
+        if AA.fails >= K.AA_FAIL_LIMIT then
+            AA.dead = true
+            notify("Anti-aim stopped: cmd:set_view_angles is rejected. Save & Reload to try again.")
+        end
+        return AA.idle("ERROR")
+    end
+    AA.fails = 0
+    AA.fix_movement(cmd, cam, yaw)
+    if CFG.aa_lock then pcall(cmd.lock_angles, cmd) end
+
+    AA.active, AA.why, AA.src = true, "ON", src
+    AA.set_label((src == "BUILDER") and s_upper(ITEMS.AA_STATE[si]) or src)
+end
+
+-- Shuffle when hit: bullet damage taken from an enemy.
+function AA.on_player_hurt(ev)
+    if not CFG.aa_on or not CFG.aa_hurt then return end
+    local lc = entity.local_controller()
+    local vic, att = safe(ev.get_controller, ev, "userid"), safe(ev.get_controller, ev, "attacker")
+    if not lc or not vic or not att then return end
+    local la = safe(lc.address, lc)
+    if la == nil or safe(vic.address, vic) ~= la or safe(att.address, att) == la then return end
+    if WPN.non_gun_name(safe(ev.get_string, ev, "weapon")) then return end
+    AA.hurt_sign = -AA.hurt_sign
+    AA.hurt_until = STATE.rt + CFG.aa_hurt_time
+    VIS.push("info", "anti-aim shuffled (hit taken)")
+end
+
+function AA.reset()
+    AA.at_yaw, AA.knife_yaw, AA.t_eye, AA.scan_t, AA.fs_side = nil, nil, nil, -1e9, 0
+    AA.hurt_until, AA.manual, AA.key_prev = -1e9, nil, {}
+    AA.fails, AA.dead, AA.rot_ok = 0, false, true
+end
+
+-- Presets write the Shared condition; overrides of other conditions are left alone.
+function AA.preset(name, values)
+    for id, v in pairs(values) do
+        local r = REG["aa1_" .. id]
+        if r then write_el(r, v) end
+    end
+    cfg_tick(true)
+    notify("Anti-aim preset applied to the Shared condition: " .. name)
+end
+
+function ACT.aa_preset_jitter() AA.preset("jitter backward", { pitch = 2, base = 2, yaw = 180, mod = 2, range = 60, delay = 1 }) end
+function ACT.aa_preset_static() AA.preset("static backward", { pitch = 2, base = 2, yaw = 180, mod = 1 }) end
+function ACT.aa_preset_spin() AA.preset("spin", { pitch = 2, base = 1, yaw = 0, mod = 6, speed = 30 }) end
+
+-- Arrow next to the crosshair: manual direction (accent) or freestanding side (amber).
+function AA.arrows(P)
+    if not (CFG.aa_arrows and AA.active) or STATE.sw <= 0 then return end
+    local m, fs = AA.manual, AA.src == "FREESTAND"
+    if not m and not fs then return end
+    local tag = fs and (AA.fs_side > 0 and "LEFT" or "RIGHT") or AA.MANUAL[m][3]
+    local col = fs and P.warn or P.acc
+    local cx, cy, d, z = floor(STATE.sw * 0.5), floor(STATE.sh * 0.5), 46, 9
+    if tag == "LEFT" then render.triangle_filled(cx - d - z, cy, cx - d, cy - z, cx - d, cy + z, col)
+    elseif tag == "RIGHT" then render.triangle_filled(cx + d + z, cy, cx + d, cy - z, cx + d, cy + z, col)
+    elseif tag == "BACK" then render.triangle_filled(cx, cy + d + z, cx - z, cy + d, cx + z, cy + d, col)
+    else render.triangle_filled(cx, cy - d - z, cx - z, cy - d, cx + z, cy - d, col) end
 end
 
 -- ============================================================================
@@ -2981,6 +3846,7 @@ local function trip(name)
     RB.paused = false
     if STATE.strikes >= K.ERR_STRIKES then
         STATE.failed = true
+        pcall(ESPX.remove)
         notify("Too many errors in '" .. name .. "': 0x stopped, ragebot values restored. Fix the cause and Save & Reload.")
     else
         STATE.suspend_until = STATE.rt + K.ERR_COOLDOWN
@@ -2991,7 +3857,7 @@ end
 -- Every callback error is caught here and never reaches the game.
 local function guard(name, fn)
     return function(a, b, c)
-        if STATE.failed and name ~= "unload" then return end
+        if STATE.failed then return end
         STATE.rt = globals.realtime()
         if STATE.suspend_until then
             if STATE.rt < STATE.suspend_until then return end
@@ -3013,20 +3879,35 @@ local function guard(name, fn)
 end
 
 local function hook(name, fn)
-    EVENTS[#EVENTS + 1] = events.on(name, guard(name, fn))
+    local ok, id = pcall(events.on, name, guard(name, fn))
+    if ok and id ~= nil then
+        EVENTS[#EVENTS + 1] = id
+    else
+        say("event '" .. name .. "' not available: " .. tostring(id))
+    end
 end
 
--- Createmove: capture the angles actually sent (silent aim aware), run the ragebot assist.
-local function on_createmove(cmd)
+local LIFE = {}
+
+-- Createmove: capture the angles actually sent, refresh local state, run the ragebot assist.
+function LIFE.createmove(cmd)
     local a = safe(cmd.view_angles, cmd)
     if a then STATE.cmd_angles = vector(a.x, a.y, 0) end
     local lp = entity.local_pawn()
-    if lp then STATE.lp_air = (safe(lp.on_ground, lp) == false) end
+    if lp and safe(lp.alive, lp) == true then
+        RB.movement(lp, cmd)
+        RES.sample_spread(lp)
+    else
+        lp = nil
+        STATE.lp_air, STATE.lp_moving, RB.mstate = false, false, nil
+    end
+    STATE.lp_dead = (lp == nil)
     if STATE.rt - RB.paint_t > K.PAINT_TIMEOUT then RB.background(STATE.rt) end
-    RB.tick(cmd)
+    RB.tick(cmd, lp)
+    AA.run(cmd, lp)
 end
 
-local function on_paint()
+function LIFE.paint()
     local now = STATE.rt
     RB.paint_t = now
     RB.background(now)
@@ -3039,17 +3920,28 @@ local function on_paint()
     VIS.paint()
 end
 
-local function on_level_init()
+function LIFE.level_init()
     RES.on_level_init()
     RB.on_level()
+    AA.reset()
 end
 
-local function on_level_shutdown()
+function LIFE.level_shutdown()
     RES.on_level_shutdown()
     RB.on_level()
 end
 
-local function boot()
+function LIFE.unload()
+    STATE.rt = globals.realtime()
+    pcall(ESPX.remove)
+    pcall(RB.on_unload)
+    pcall(RES.store_save, false)
+    if SET.dirty then pcall(IO.save) end
+    for i = 1, #EVENTS do pcall(events.off, EVENTS[i]) end
+    say("unloaded")
+end
+
+function LIFE.boot()
     STATE.rt = globals.realtime()
     local ok_dt, dt = pcall(globals.interval)
     if ok_dt and type(dt) == "number" and dt > 0 then RB.g_tick = K.GRAVITY * dt end
@@ -3059,40 +3951,37 @@ local function boot()
     VIS.init()
     build_menu()
 
+    IO.load()                                    -- snapshot first: it may carry manual paths
     local restored = Journal.restore()
-    local scanned = Bind.scan()                  -- before the first config read: status is ready at once
+    local scanned = Bind.scan()
     RB.boot_status = scanned and Bind.summary() or "config.keys unavailable"
     RB.set_status(RB.boot_status)
 
-    settings_load()
+    PS.last = nil
     cfg_tick(true)
-    SET.dirty = false
+    PS.last = CFG.preset
+    SET.dirty = SET.migrated == true             -- v3 / s1 import: write the v4 snapshot once
 
     RES.store_load()
     RES.insecure = safe(client.insecure) == true
     STATE.insecure = RES.insecure
     local ok, open = pcall(input.menu_open)
     STATE.menu_open = ok and open == true
+    ESPX.sync()
 
     hook("frame_stage",    RES.frame)
-    hook("createmove",     on_createmove)
-    hook("paint",          on_paint)
+    hook("createmove",     LIFE.createmove)
+    hook("paint",          LIFE.paint)
     hook("weapon_fire",    RES.on_weapon_fire)
     hook("player_hurt",    RES.on_player_hurt)
+    hook("player_hurt",    AA.on_player_hurt)
     hook("player_death",   RES.on_player_death)
     hook("round_start",    RES.on_round_start)
     hook("menu_toggled",   RB.on_menu_toggled)
-    hook("level_init",     on_level_init)
-    hook("level_shutdown", on_level_shutdown)
-
-    events.on("unload", function()
-        STATE.rt = globals.realtime()
-        safe(RB.on_unload)
-        safe(RES.store_save)
-        if SET.dirty then safe(settings_save) end
-        for i = 1, #EVENTS do safe(events.off, EVENTS[i]) end
-        say("unloaded")
-    end)
+    hook("level_init",     LIFE.level_init)
+    hook("level_shutdown", LIFE.level_shutdown)
+    local uok, uerr = pcall(events.on, "unload", LIFE.unload)
+    if not uok then say("unload hook failed: " .. tostring(uerr)) end
 
     if restored > 0 then notify("Restored " .. restored .. " ragebot values after a crash") end
     local cb = MENU.combo_base
@@ -3105,9 +3994,10 @@ local function boot()
     end
 end
 
-local boot_ok, boot_err = pcall(boot)
+local boot_ok, boot_err = pcall(LIFE.boot)
 if not boot_ok then
     STATE.failed = true
     pcall(Bind.release, true)
+    pcall(Journal.flush, true)
     say("boot error: " .. tostring(boot_err))
 end
